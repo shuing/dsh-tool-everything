@@ -1,0 +1,71 @@
+{
+  "name": "dsh-tool-everything",
+  "//exports": "子路径通配是兼容兜底，非组件入口；3b／3c 搬文件后重核是否仍够用。",
+  "description": "Model-facing Windows search tool backed by the Everything index (Everything64.dll FFI via koffi)",
+  "version": "0.5.1",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./everything": "./lib/components/everything/index.js",
+    "./everything/package.json": "./lib/components/everything/package.json",
+    "./anytxt": "./lib/components/anytxt/index.js",
+    "./anytxt/package.json": "./lib/components/anytxt/package.json",
+    "./everything/locale/*": "./lib/components/everything/locale/*",
+    "./anytxt/locale/*": "./lib/components/anytxt/locale/*",
+    "./*": "./*"
+  },
+  "scripts": {
+    "verify": "node test/verify.mjs",
+    "anytxt:verify": "node test/anytxt.verify.mjs",
+    "verify:all": "node test/verify.mjs && node test/anytxt.verify.mjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "files": [
+    "dsh.plugin.json",
+    "lib/index.js",
+    "lib/paths.mjs",
+    "lib/components/everything/sdk.mjs",
+    "lib/components/everything/query-worker.mjs",
+    "lib/components/everything/status.mjs",
+    "lib/components/anytxt/anytxt.mjs",
+    "lib/shared/format.mjs",
+    "lib/shared/limits.mjs",
+    "lib/shared/config.mjs",
+    "lib/shared/prompt-orders.mjs",
+    "lib/shared/type-name.mjs",
+    "lib/components/everything/index.js",
+    "lib/components/everything/package.json",
+    "lib/components/anytxt/index.js",
+    "lib/components/anytxt/package.json",
+    "lib/components/everything/locale/en.json",
+    "lib/components/anytxt/locale/en.json",
+    "native/Everything64.dll",
+    "native/LICENSE",
+    "LICENSE",
+    "README.md",
+    "docs/architecture.md",
+    "cordis.patch.yml",
+    "test/verify.mjs",
+    "test/anytxt.verify.mjs"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.1 <1.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "dependencies": {
+    "koffi": "3.1.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.2.0-rc.1 <1.0.0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.2.0-rc.1 <1.0.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1 <1.0.0",
+    "@deepseek-ai/dsh-timeout": ">=0.2.0-rc.1 <1.0.0",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  }
+}

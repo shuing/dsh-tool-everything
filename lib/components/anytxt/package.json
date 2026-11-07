@@ -1,0 +1,8 @@
+{
+  "name": "dsh-tool-everything-anytxt",
+  "version": "0.5.1",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "内容检索，走 Anytxt 本地 9920"
+}

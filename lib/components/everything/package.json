@@ -1,0 +1,8 @@
+{
+  "name": "dsh-tool-everything-everything",
+  "version": "0.5.1",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "文件名检索，走 Everything64.dll"
+}

@@ -1,0 +1,16 @@
+- insert:
+    - id: tool-everything
+      name: 'dsh-tool-everything'
+    # 外壳行只做「探测宿主能力 → 组 caps」，不注册任何工具、也不向组件传 caps，所以
+    # config 写在这一行不会生效。配置属于下面的两条组件行（实测：外壳行配 maxResults/timeoutMs
+    # 得到 { tools: [], promptSections: [] }，组件行配同一份值才进 description）。
+    - id: dsh-tool-everything-everything
+      name: 'dsh-tool-everything/everything'
+      config:
+        maxResults: 100
+        timeoutMs: 8000
+    - id: dsh-tool-everything-anytxt
+      name: 'dsh-tool-everything/anytxt'
+      config:
+        anytxtMaxResults: 20
+        anytxtTimeoutMs: 15000
