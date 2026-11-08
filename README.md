@@ -1,7 +1,7 @@
 # dsh-tool-everything
 
 > 🔀 **本仓库是 [roxyyn0304/dsh-tool-everything](https://github.com/roxyyn0304/dsh-tool-everything) 的 fork**，
-> 在上游 `0.4.14` 的基础上继续维护；本 fork 相对上游改了什么见下文
+> 在上游  的基础上继续维护；本 fork 相对上游改了什么见下文
 > 「🔀 本 fork 相对上游的差异」一节。
 > 代码以 MIT 许可发布，**原始版权归原作者 roxyyn0304 所有**，上游 [LICENSE](LICENSE) 原文保留未改。
 
@@ -428,7 +428,7 @@ MIT。**原始版权归原作者 [roxyyn0304](https://github.com/roxyyn0304/dsh-
 
 ## 🙏 致谢
 
-- [roxyyn0304](https://github.com/roxyyn0304/dsh-tool-everything) — **本插件的原作者**，本 fork 基于他的 `0.4.14`
+- [roxyyn0304](https://github.com/roxyyn0304/dsh-tool-everything) — **本插件的原作者**，本 fork 基于他的 
 - [voidtools](https://www.voidtools.com) — Everything 文件搜索引擎
 - [koffi](https://koffi.dev) — Node.js FFI 库
 - [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — DSH Agent 框架
