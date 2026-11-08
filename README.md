@@ -1,7 +1,7 @@
 # dsh-tool-everything
 
 > 🔀 **本仓库是 [roxyyn0304/dsh-tool-everything](https://github.com/roxyyn0304/dsh-tool-everything) 的 fork**，
-> 在上游  的基础上继续维护；本 fork 相对上游改了什么见下文
+> 在上游 `0.4.14` 的基础上继续维护；本 fork 相对上游改了什么见下文
 > 「🔀 本 fork 相对上游的差异」一节。
 > 代码以 MIT 许可发布，**原始版权归原作者 roxyyn0304 所有**，上游 [LICENSE](LICENSE) 原文保留未改。
 
@@ -66,6 +66,16 @@ dsh plugin --profile web add "github:shuing/dsh-tool-everything"
 1. `anytxt_search` 的 `modified` 列改成**本地时间**。索引回的是 ISO(UTC)，旧实现只把 `T`／`Z` 去掉就印出来，同一个文件会比 `everything_search` 那一列早整整一个时区（本机 8 小时），且两边都没有时区标记——读的人只会得出「这是两个不同版本」。现在两个面共用 `lib/shared/format.mjs` 的同一个本地时间格式化函数。
 2. `anytxt_read` 在 `ref` 的 fid 不存在时不再静默返回 `0 of 0 characters`（那是「读到一个空文档」的语义），改报 `ANYTXT_FID_NOT_FOUND`。实测服务端对不存在的 fid 回 `errno 1` + `text: null`，对有效 fid 回 `errno 0` + 字符串，所以两者可区分；`GetFragmentAll` 两种都回 `errno 0`，`fragments` 侧分不出，只有 `full` 能报。此前 `errno` 只在 `anytxt_sync_index` 那条路径上被读过。
 
+### 0.5.2 定义瘦身：约束搬进运行时输出
+
+`anytxt_*` 四个工具的 description 只留骨架，把「什么时候才用得上」的细节搬到**每次的结果里**（与 `everything_search` 把 `path ignored` / 零命中出路写进 header 是同一做法）：
+
+1. description 实测瘦身：`anytxt_search` 1014→674、`anytxt_read` 1085→524、`anytxt_status` 402→193、`anytxt_sync_index` 958→600 字符；提示词段 3255 仍是 381 字符（预算 400）。
+2. 类型边界、`accepted ≠ ready`、片段上限与中文倒序、续读句柄、`content index only` 全部改成渲染尾部／页脚，见各工具的「运行时输出」。
+3. `anytxt_search` 的未知参数改为**报参数错误**（此前 `countOnly` 被静默忽略，却照样列出路径，读起来像「只报了数」）。
+4. 头部 `(offset X)` 修好：`offset > 0` 时必出现，不再把非首页印成 `Found N results`。
+5. `anytxt_status` 的 description 与代码对齐：探针确实会发一次固定词、仅 txt 的 `Search`，所以不再写「no query runs」，改写成「不读文档、不跑调用方的查询」。
+
 ## 📁 文件树
 
 ```
@@ -125,20 +135,21 @@ dsh-tool-everything/
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `search` | string | 必填，Everything 搜索表达式 |
-| `path` | string | 目录收窄，渲染成 `path:<value>`；含空格自动加引号。目录不存在默认报错，错误消息给出最近存在的父目录与三条出路（确认目录、改通配、省略 `path:`，或传 `pathMustExist: false`）。搜索串里已带 `path:` 时再传 `path` 直接报参数错误（两个 `path:` 会 AND 成 0 条） |
-| `pathMustExist` | boolean | 可选，缺省 `true`。传 `false` 时 `path` 不存在不报错，改为忽略该 scope 整盘搜索，结果头明写 `path ignored: does not exist` |
+| `search` | string | 必填，Everything 搜索表达式；Everything 原生语法**原样透传**（`size:>10mb`、`dateModified:thisweek`、`ext:zip`、`content:词`、`folder:`，实测可用：`size:>100mb` @ `C:\Windows` 回 60 条）；`regex:` 双引号形态承载空格且**大小写不敏感**（实测 `regex:"DEEPSEEK-AI"` 命中 `@deepseek-ai`）；`ext:` **只有前缀没有值**时直接报参数错误（`ext: requires a value`，旧版回 5／1／0 那种既不是「无过滤」也不是错误的数） |
+| `path` | string | 目录收窄，渲染成 `path:<value>`；含空格自动加引号。**仅接受目录**：指向一个文件会报参数错误（`path:` 是前缀 scope，文件路径恒 0 命中，实测 `*.md` + 文件 path 回 0 条且旧版毫无提示），改传父目录并把文件名写进 `search`，或改用 `ext:`。尾部通配会被折叠成父目录：实测 `path:C:\x\*` 回 **0 条**、`path:C:\x` 回 **19 条**——`path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。目录不存在默认报错，错误消息给出最近存在的父目录与两条出路（确认目录、省略 `path:`，或传 `pathMustExist: false` + `allDrives: true`）——旧文案里「改通配」那条出路已被实测推翻、已删除。**尾部通配一律折叠成静态前缀**：`dir\*`、`dir\**`、`name*` 三种写法：`dir\\*`／`dir\\**` 折成该目录本身（等价直连），`name*` 折成名字前缀（保留前缀语义、不补尾分隔符）；实测旧版 `path: …\dsh-voice*` 与 `…\dsh-voice-s*` 都回 **0 条**、直连却有命中，且不报路径无效），再交给 `path:` 自己的前缀匹配；中间通配（`C:\a*\b`）没有可证明的等价物，原样保留。通配 scope 的**父目录也不存在**时同样报路径错误（带 `nearest existing parent: …`），不再落成 `no match in the index`。搜索串里已带 `path:` 时再传 `path` 直接报参数错误（两个 `path:` 会 AND 成 0 条） |
+| `pathMustExist` | boolean | 可选，缺省 `true`。传 `false` 只表示「容忍这个 scope 可能不存在」，**它本身不再触发全盘回退**——全盘要再加 `allDrives: true` 二次确认。理由：把 scope 丢掉等于搜整个索引（实测漏路径那次命中 **22541** 条），而盘上两套同构插件目录会让结果出双份 |
+| `allDrives` | boolean | 可选，全盘回退的二次确认：只在同时传 `pathMustExist: false` 时有意义，也只有那时才真的丢掉 scope，结果头明写 `path ignored: does not exist (...) so this searched the whole index`。单独出现是参数错误（它读起来像「搜全盘」却什么都不做）——真想搜全盘就别传 `path` |
 | `maxResults` | number | 单次返回条数，1–500，默认见常量 `DEFAULT_MAX_RESULTS`，文档不写死数字 |
 | `offset` | number | 分页起点，默认 0；接上一条结果里的 `nextOffset` 继续翻页。只配翻页用：与 `countOnly` 互斥，`countOnly: true` 且 `offset > 0` 直接报参数错误（只报数就没有「第几页」这回事，旧版会静默返回同一个总数） |
 | `exclude` | string | `;` 分隔的排除片段，渲染成 `!path:<片段>`；默认 `$RECYCLE.BIN; System Volume Information; WinSxS`，传空串关闭 |
-| `sort` | string | 可选，排序字段：`name`/`path`/`size`/`dateModified`/`dateCreated`，其它值报参数错误。白名单在 `execute` 里校验，不走 schema enum（本宿主 DSL 挑食）；不传则保持 Everything 默认序 |
+| `sort` | string | 可选，排序字段：`name`/`path`/`size`/`dateModified`/`dateCreated`，其它值报参数错误。白名单在 `execute` 里校验，不走 schema enum（本宿主 DSL 挑食）；**不传按 `name` 升序**——实现里显式写回 SDK 排序值 1（`SetSort` 是进程级状态，不写回就会让上一条查询的排序漏给这一条），所以头部与 `offset` 分页恒按 name 升序解释 |
 | `descending` | boolean | 可选，把 `sort` 反序；`sort` 缺省时按 `name` 处理，即 `descending: true` 就是 name 降序（不是「忽略」——这是 0.3.0 起的既有行为，与「不传新参数行为不变」一致） |
 | `countOnly` | boolean | 可选，只报匹配总数：`items` 为空数组、`total` 是全集计数，路径/大小/时间的解码整段跳过——先量规模再翻页就用它。与正的 `offset` 互斥，同时传报参数错误 |
 | `type` | string | 可选，`file` 或 `dir`，渲染成 Everything 自己的 `file:`／`folder:`（统一小写）；其它值报参数错误。白名单在 `execute` 里校验，不走 schema enum（理由同 `sort`）。可与 `path`/`sort`/`countOnly` 共存，它只是一个搜索词；搜索串里已带 `file:`／`folder:` 时再传 `type` 直接报参数错误（两个词会 AND 成 0 条），错误消息给两条出路：去掉 `type`，或去掉搜索串里的那项 |
 
-输出字段：`items`（每项 `path`/`folder`/`size`/`mtime`，`mtime` 是整数 epoch 毫秒（FILETIME 换算后取整，分数毫秒过不了宿主的无损 JSON 判定），读不到给 `-1`；文本里每条按 `路径<TAB>大小<TAB>本地时间` 打印，读不到大小或时间都打 `-`（三列恒在，不留连着的 TAB），不印 1970）、`total`（命中总数）、`truncated`、可选 `nextOffset`、`offset`（本页起点，钳后的真实值）、`countOnly`、`dbLoaded`（Everything 索引是否已加载）、`excluded`（本次生效的排除规则条数）、`pathIgnored`（仅当 `pathMustExist: false` 丢掉了一个不存在的 scope 时带上原 scope）、`typeIgnored`（仅当搜索串里已带 `file:`／`folder:`、`type` 因此未追加时带上那个 `type` 值）。
+输出字段：`items`（每项 `path`/`folder`/`size`/`mtime`，`mtime` 是整数 epoch 毫秒（FILETIME 换算后取整，分数毫秒过不了宿主的无损 JSON 判定），读不到给 `-1`；文本里每条按 `路径<TAB>大小<TAB>本地时间` 打印，读不到大小或时间都打 `-`（三列恒在，不留连着的 TAB），不印 1970）、`total`（命中总数）、`truncated`、可选 `nextOffset`、`offset`（本页起点，钳后的真实值）、`countOnly`、`dbLoaded`（Everything 索引是否已加载）、`excluded`（本次生效的排除规则条数）、`pathIgnored`（仅当 `pathMustExist: false` + `allDrives: true` 丢掉了一个不存在的 scope 时带上原 scope）、`typeIgnored`（仅当搜索串里已带 `file:`／`folder:`、`type` 因此未追加时带上那个 `type` 值）。
 
-header 形态照实写，别去找不存在的句子：截断时是 `Found N of M results (offset X)`，全量时是 `Found M results`——`Found N of M` 只在截断时出现；`countOnly: true` 时 header 只有 `Found <total> matches (count only)`，`items` 为空数组、`truncated` 恒为 `false`（也就没有 `nextOffset`）。非 countOnly 一律在其下固定再输出一行 `shown N / total M / nextOffset X`（没有下一页时 `nextOffset` 打 `-`），把「这只是采样」写进结构；countOnly 不出这一行。`pathMustExist: false` 丢过 scope 时 header 追加 `path ignored: does not exist (…)`，索引未加载时追加 `index is not loaded yet`。（`type not appended` 只可能出现在直接调 `buildSearch` 的路径上；工具面遇到 `type` 与串内 `file:`／`folder:` 撞车已改在执行期报参数错误，不再走到头行。）
+header 形态照实写，别去找不存在的句子：截断或 `offset > 0` 时是 `Found N of M results (offset X)`，首页且未截断时是 `Found M results`；`offset` 越过总数时头行追加 `offset N is past the end: total is M`，不再把空页印成全量；`countOnly: true` 时 header 只有 `Found <total> matches (count only)`，`items` 为空数组、`truncated` 恒为 `false`（也就没有 `nextOffset`）。非 countOnly 一律在其下固定再输出一行 `shown N / total M / nextOffset X`（没有下一页时 `nextOffset` 打 `-`），把「这只是采样」写进结构；countOnly 不出这一行。`pathMustExist: false` 丢过 scope 时 header 追加 `path ignored: does not exist (…)`，索引未加载时追加 `index is not loaded yet`。**0 命中**且范围未被改写、索引已加载时，header 追加 `= no match in the index (indexed volumes only)`，并在页脚给出一条放宽的出路 `widen: drop path:, drop ext:, or relax the pattern`（当次有排除规则生效时，再带一句 `exclude:""` 的回头路）——这两句共用一个门控：`countOnly`、索引未加载、`pathIgnored`/`typeIgnored` 非空时一律不出。（`type not appended` 只可能出现在直接调 `buildSearch` 的路径上；工具面遇到 `type` 与串内 `file:`／`folder:` 撞车已改在执行期报参数错误，不再走到头行。）
 
 ### `everything_status`（探活，无参数）
 
@@ -157,12 +168,21 @@ header 形态照实写，别去找不存在的句子：截断时是 `Found N of 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `pattern` | string | 必填，内容查询词；支持与／或／非。双引号包起来的整句按整句匹配——**引号原样留在 `pattern` 里发给服务端**（实测服务端完全忽略 `st`，整句语义只由引号决定；`st` 仍照发，但无作用）。去掉引号就退化成多个词分别匹配 |
-| `dir` | string | 必填，一个已建索引的目录；只过滤，不建库（建库/刷新用 `anytxt_sync_index`）。空值直接报参数错误，不猜整盘。分隔符会归一（`/` 与 `\` 等价）——实测正斜杠写法服务端静默回 0 命中 |
+| `dir` | string | 必填，一个已建索引的目录，**也可以是盘根**（`C:\` = 整个 C 盘，`filterDir` 是前缀匹配）；只过滤，不建库（建库/刷新用 `anytxt_sync_index`）。空值直接报参数错误，不猜整盘。分隔符会归一（`/` 与 `\` 等价）——实测正斜杠写法服务端静默回 0 命中 |
 | `ext` | string | 可选扩展名过滤，原样进 `filterExt`（缺省 `*`）。多值只认**分号**分隔 |
-| `limit` | number | 单次条数 1–300（API v1 的整数区间，越界会被 `-32602` 拒），默认取 `anytxtMaxResults`（20），越界在 `execute` 里钳，下发时传真整数 |
-| `offset` | number | 分页起点，接上一条结果里的 `nextOffset`；钳到 **2^31-1**（`ANYTXT_OFFSET_CAP`）——`GetResult` 只收有符号 32 位整数，实测 `2147483648` 起被 `-32602` 拒，钳位就是为这个 |
+| `limit` | number | 单次条数 1–300（API v1 的整数区间，越界会被 `-32602` 拒），默认取 `anytxtMaxResults`（20），越界在 `execute` 里钳，下发时传真整数；**钳位会写进结果头**（`limit N is outside 1-300 and was clamped`），不再静默取 1 或全量 |
+| `offset` | number | 分页起点，接上一条结果里的 `nextOffset`；钳到 **2^31-1**（`ANYTXT_OFFSET_CAP`）——`GetResult` 只收有符号 32 位整数，实测 `2147483648` 起被 `-32602` 拒，钳位就是为这个；**越过总数**时空页会写明 `offset N is past the end: total is M`（与 `everything_search` 的 FIX-2 同款，不再只回一个空页） |
 | `order` | number | 排序：0 默认 / 1 修改时间升 / 2 修改时间降 / 3 路径升 / 4 路径降（五值真机实测，同一查询各回不同文件），其它值报参数错误。白名单在 `execute` 里校验，不走 schema enum（理由同 `everything_search` 的 `sort`／`type`）。与 `offset` 同用时的翻页稳定性未验证——时间序在索引更新时可能错位，长翻页请固定 `order: 0` 或改用路径序 |
 | `exclude` | string | `;` 分隔的路径片段，大小写不敏感的**子串**匹配，命中即从这一页的结果里剔除；默认 `$RECYCLE.BIN; System Volume Information; WinSxS`，传空串关闭。生效条数写进结果头（`(3 exclusion rules applied)`），0 条时不印——排除是显式的，不做静默丢结果 |
+
+**参数纪律**：`pattern`／`dir`／`ext`／`limit`／`offset`／`order`／`exclude` 之外的键一律报 `ANYTXT_INVALID_ARGUMENT`，**没有 `countOnly`**（全集条数就是 `total`，页大小由 `limit` 决定）——旧实现会把 `countOnly` 静默忽略却照样列出路径，读起来像「只报了数」。
+
+**运行时输出**（约束跟着结果走，不占常驻 description）：
+
+- 正常页尾：`(indexed copy, enabled types only: an unknown, bitmap or database file carries no text)`；
+- 截断页尾：`pass offset N` + 同一条类型边界；
+- **0 命中**：页脚明说 `no match in the index - only folders an index was built for are searchable, and only the types Anytxt's index settings enable are extracted`，并给出放宽出路；
+- header 的 `(offset X)` 在 `offset > 0` 时**一定出现**——此前只在截断时出现，`total=11 / offset=10` 那一页会印成 `Found 11 results`，读起来像「这就是全部」。
 
 输出：`items`（每项 `ref`、`path`，`size`／`modified` 读不到就整键不写）、`total`、`truncated`、`offset`、可选 `nextOffset`。模型可见文本里每行是 `ref<TAB>路径<TAB>大小<TAB>本地时间`——**`ref` 是第一列**，也是拿到 `anytxt_read` 所需 id 的唯一途径（fid 无法从路径推导）；大小与时间读不到打 `-`，`ref` 那一列恒在。header 固定带一句 `indexed copy, may be stale`；默认三条排除见 `exclude` 参数，生效条数写成 `(N exclusion rules applied)`。翻页口径与 `everything_search` 一致，但 `nextOffset` 按**服务器原始返回行数**推进（不是过滤后条数）：实测 `GetResult` 的窗口随 `offset` 1:1 滑动，用过滤后条数起头会覆盖原始页尾、把没被排除的行重复发出来。
 
@@ -178,17 +198,23 @@ header 形态照实写，别去找不存在的句子：截断时是 `Found N of 
 
 互斥在 `execute` 里显式判，一律 `ANYTXT_INVALID_ARGUMENT`：非法 `mode`、`fragments` 缺 `query`、`fragments` 传了 `offset`、`full` 传了 `query`（`max` 两种模式都收：`fragments` 是段数，`full` 是字符数）。不靠 schema 拦——本宿主的值 DSL 不收 `oneOf`／`enum`，写进去整条工具会被丢掉。输出：`fragments` 给 `snippets`／`totalSnippets`；`full` 给 `text`／`totalChars`／`returned`／`offset`／`truncated`。
 
+**运行时输出**：`fragments` 的页脚固定带 `(at most 8 passages exist; Anytxt passages can read backwards in Chinese - switch to mode full when one does)`；`full` 被截断时页脚直接给 `(continue with offset N)`，调用方不必自己算 `offset + returned`。`totalChars` 是整篇抽取文本的长度，`returned` 是本次实际带回来多少。
+
 > ⚠️ `full` 模式的传输量没有上限：`GetRawTextByFID` 忽略 `offset`／`limit`（回显只有 `{fid}`，实测一个文件直接回 1,219,343 字符），整篇抽取文本每次调用都会传过来、`max`／`offset` 只裁返回窗口。所以大文档翻页是每页重下全文，峰值内存是 O(文档) 而不是 O(max)——先用 `fragments` 判断值不值得读，再取全文。
 
 `anytxt_status`：无参数，输出仅 `ok`／`code`／`message`／`url`（`additionalProperties: false`）。只答「内容索引现在能不能用」，内部 `state` 不外露，也不写 `version`（Anytxt 的 RPC 没有版本方法）。三态：`ANYTXT_READY`（服务端对 Search 有应答即判可用——0 命中只作附注，因为一次探针分不出「索引为空」和「索引里没有这个词」）、`ANYTXT_MISSING_TOOL`、`ANYTXT_DOWN`，探活永不抛。`ANYTXT_INDEX_NOT_LOADED` 保留在码表里但不再产出；索引是否真的为空由真正的搜索回答（空结果 + `indexed copy, may be stale`）。
+
+**运行时输出**：渲染末尾固定追加一行 `(content index only: when this is down, everything_search and grep stay usable)`——`ok: false` 只说明内容面不可用，最容易被读成整台机器不可用。
 
 `anytxt_sync_index`（按目录建库，插件里唯一会改索引状态的一步）
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `folder` | string | 必填，绝对 Windows 目录。相对路径、纯正斜杠路径、不存在的目录一律当场报参数错误——实测这三种服务端都回 `errno 0` 却什么都不建，所以三条都在插件侧拦，不靠服务端 |
+| `folder` | string | 必填，绝对 Windows 目录。无盘符的路径（相对路径、根相对路径）与不存在的目录一律当场报参数错误——实测这两种服务端都回 `errno 0` 却什么都不建，所以都在插件侧拦，不靠服务端。**正斜杠不报错**：先归一成反斜杠再建库（`C:/Users/x` 与 `C:\Users\x` 等价），因为原始正斜杠正是那个「回 `errno 0` 却什么都不建」的实测形态 |
 
 输出：`folder`（归一成反斜杠后的路径）、`ok`、`code`、`message`。回 `ok` 只表示「请求已被接受」，建库在后台跑，通常数秒后 `anytxt_search` 就能搜到——确认方式就是再搜一次。删除、移动、重命名一概没有绑定。
+
+**运行时输出**：渲染末尾固定追加 `(accepted, not ready - building runs in the background, so confirm with anytxt_search after a few seconds; only the types Anytxt's index settings enable get text, so an unknown, bitmap or database file is accepted with zero text and never matches)`——「建库被接受」与「只有启用类型才有文本」这两条只在真建库时才需要看。
 
 ## 💬 提示词说明
 
@@ -207,12 +233,14 @@ Report in three steps: header, paths verified with read or glob, paging; unverif
 **第二段**：`name: tool:anytxt_search`，`order: 3255`，由内容面注册（`lib/components/anytxt/index.js`）：
 
 ```
-Use: anytxt_search for text inside PDF/DOCX/XLSX/PPTX/EPUB files - finding files by name stays everything_search's job, workspace source stays grep's.
-The Anytxt index is its own copy: hits describe the indexed copy and may be stale, and dir only filters - it indexes nothing.
-Read a hit back with anytxt_read: mode fragments for the passages around a query, mode full for the extracted text.
+Use: anytxt_search for text inside indexed folders' enabled types (PDF/DOCX/XLSX/PPTX/EPUB, Office, source); everything_search finds names, grep reads one known file.
+Hits describe the indexed copy and may be stale; dir only filters; bitmaps, databases and unknown types carry no text.
+Read back with anytxt_read (fragments or full); Chinese fragments can run backwards - use full.
 ```
 
-**为什么只写这些**：prompt 只承载两件事——「要不要调这个工具」（用途与三者的分工）和「怎么汇报」（跨轮行为纪律，比如未核验路径要标成「候选，未核验」）。语法要点、`regex:` 的引号形态、header 怎么读、参数之间的互斥，全部归**工具 description 与各参数 description**：那两份每轮都在上下文里，prompt 再抄一遍就是同一句话占两处字符。栈的边界也写进 prompt——按名找文件归 `everything_search`，工作区源码归 `grep`，`glob` 管工作区内路径匹配。
+**为什么只写这些**：prompt 只承载两件事——「要不要调这个工具」（用途与三者的分工）和「怎么汇报」（跨轮行为纪律，比如未核验路径要标成「候选，未核验」）。语法要点、`regex:` 的引号形态、header 怎么读、参数之间的互斥，全部归**工具 description 与各参数 description**：那两份每轮都在上下文里，prompt 再抄一遍就是同一句话占两处字符。栈的边界也写进 prompt——按名找文件归 `everything_search`，已知文件精读归 `grep`，`glob` 管工作区内路径匹配（prompt 不再声称「工作区源码归 grep」：索引设置启用源码类型后，那句话会让模型主动放弃已经建好的能力）。
+
+**边界与上限不进 prompt**：`anytxt_*` 的类型边界、`accepted ≠ ready`、片段上限与中文倒序、续读句柄、探活口径，全部写在**每次的结果里**（见各工具的「运行时输出」），与 `everything_search` 把 `path ignored` / 零命中出路写进 header 是同一做法。
 
 宿主如果没有 `systemPrompt.section`（唯一软探测项），只记一条 warn，**工具照常注册**，只是少了这两段引导。
 
@@ -306,7 +334,7 @@ Read a hit back with anytxt_read: mode fragments for the passages around a query
 
 - **用途**：全盘按文件名查找，从精确匹配逐步放宽到通配符。
 - **原则**：一次查询一个意图；顺序为精确名 → `path:`／`ext:`／`size:` → 裸通配符。非 countOnly 结果附 `shown N / total M / nextOffset X` 一行，头部为 `Found M results`（全集）或 `Found N of M results (offset X)`（截断）；翻页用 `nextOffset`，不靠增大 `maxResults`。
-- **约束**：0 结果 = 索引中无，不写作「文件不存在」；头部提示索引未加载或 `dbLoaded: false` 时空结果不确定（问 `everything_status`；搜索本身不探活）；`<DIR>` 是目录，不读取；`countOnly` 不与正数 `offset` 同传；`path` 缺失报最近存在的父目录，`pathMustExist: false` 则降级为忽略该范围。
+- **约束**：0 结果 = 索引中无，不写作「文件不存在」；头部提示索引未加载或 `dbLoaded: false` 时空结果不确定（问 `everything_status`；搜索本身不探活）；`<DIR>` 是目录，不读取；`countOnly` 不与正数 `offset` 同传；`path` 缺失报最近存在的父目录；全盘回退要 `pathMustExist: false` + `allDrives: true` 两次确认——只写 `false` 是参数错误，不会静默放大到全盘。
 - **语义**：`maxResults` 的默认值与上限见参数表（由常量决定，不写死数字）；`type: file` → `file:`、`type: dir` → `folder:`；不传 `sort` 且 `descending: true` 即 name descending，不被忽略；`regex:` 支持双引号形态承载空格（如 `regex:"final report"`）；`mtime` 为整数 epoch 毫秒。
 - **报告**：原样引用头部 → 已核验路径 → 翻页方式；未核验或仅见于抽样的路径标为「候选，未核验」，不得以单次抽样的条数断言全盘命中数量。
 - **范围**：默认排除 `$RECYCLE.BIN`、`System Volume Information`、`WinSxS`；传 `exclude:""` 可包含它们。
@@ -400,7 +428,7 @@ MIT。**原始版权归原作者 [roxyyn0304](https://github.com/roxyyn0304/dsh-
 
 ## 🙏 致谢
 
-- [roxyyn0304](https://github.com/roxyyn0304/dsh-tool-everything) — **本插件的原作者**，本 fork 
+- [roxyyn0304](https://github.com/roxyyn0304/dsh-tool-everything) — **本插件的原作者**，本 fork 基于他的 `0.4.14`
 - [voidtools](https://www.voidtools.com) — Everything 文件搜索引擎
 - [koffi](https://koffi.dev) — Node.js FFI 库
 - [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — DSH Agent 框架

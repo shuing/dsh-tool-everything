@@ -9,6 +9,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const anytxt = await import(pathToFileURL(path.join(repoRoot, "lib", "components", "anytxt", "anytxt.mjs")).href);
+// A-a…A-e 的裁决在组件注册面（渲染文本 + 输出 schema）：anytxt.mjs 的钳位函数本身早就对，
+// 错的是「钳了却不说」，所以这一套还要加载 index.js 并编译四条工具来取 render。
+const anytxtFace = await import(pathToFileURL(path.join(repoRoot, "lib", "components", "anytxt", "index.js")).href);
 
 const {
 	ANYTXT_DEFAULT_FRAGMENTS,
@@ -263,6 +266,38 @@ check("the sync call uses the v1 method with folder directly in params", syncBod
 const syncBad = scriptedFetch([jsonReply({ id: 1, jsonrpc: "2.0", result: { errno: 7, data: { output: {} } } })]);
 await rejects("a non-zero errno is refused as ANYTXT_RPC", () => syncIndex({ folder: "C:\\Users\\x\\docs", exists: () => true, fetchImpl: syncBad.impl }), "ANYTXT_RPC", /errno 7/);
 await rejects("a down endpoint during sync reports ANYTXT_DOWN", () => syncIndex({ folder: "C:\\Users\\x\\docs", url: "http://127.0.0.1:9999", exists: () => true, fetchImpl: scriptedFetch([refused()]).impl }), "ANYTXT_DOWN", /ECONNREFUSED/);
+
+// --- A-a…A-e（清单 v5 第 8.3 节）：内容面的「静默 / 口径」五项 ---
+// 断言打在模型真正读到的那段文本上，而不是钳位函数本身：这五项没有一条是功能错误，全是
+// 「钳了却不说 / 口径没写」。所以这里编译四条工具，取 output.render 的结果来断。
+const faceTools = new Map();
+anytxtFace.applyAnytxtTools({ tools: { register(tool) { faceTools.set(tool.name, tool); } } }, { anytxtUrl: "http://127.0.0.1:9/rpc", anytxtTimeoutMs: 1000, anytxtMaxResults: ANYTXT_DEFAULT_LIMIT, anytxtSyncTimeoutMs: 1000 });
+check("the four anytxt tools compile for the render checks", ["anytxt_read", "anytxt_search", "anytxt_status", "anytxt_sync_index"].every((name) => faceTools.has(name)), [...faceTools.keys()].join(","));
+const renderSearch = (value) => faceTools.get("anytxt_search").output.render({}, value)[0].text;
+const renderRead = (value) => faceTools.get("anytxt_read").output.render({}, value)[0].text;
+const searchSchemaKeys = Object.keys(faceTools.get("anytxt_search")?.output?.schema?.properties ?? {});
+const readSchemaKeys = Object.keys(faceTools.get("anytxt_read")?.output?.schema?.properties ?? {});
+check("A-a/A-d the search schema can carry the clamp and scope fields", searchSchemaKeys.includes("limitClampedFrom"), searchSchemaKeys.join(","));
+check("A-c the read schema can carry the clamp field", readSchemaKeys.includes("maxClampedFrom"), readSchemaKeys.join(","));
+const zeroScoped = renderSearch({ items: [], total: 0, truncated: false, offset: 0, excluded: 3 });
+const zeroPlain = renderSearch({ items: [], total: 0, truncated: false, offset: 0, excluded: 0 });
+check("A-e a zero-hit page offers drop ext, and drop exclude only when rules are in force", /widen: drop ext/.test(zeroScoped) && /drop exclude/.test(zeroScoped) && /widen: drop ext/.test(zeroPlain) && !/drop exclude/.test(zeroPlain), `${zeroScoped.split("\n").pop()} | ${zeroPlain.split("\n").pop()}`);
+check("A-d a zero-hit page never claims a before-exclusion total", !/before exclusion/.test(zeroScoped) && !/before exclusion/.test(zeroPlain), zeroScoped.split("\n")[0]);
+const pastEnd = renderSearch({ items: [], total: 46, truncated: false, offset: 999999, excluded: 3 });
+check("A-b an empty page past the end names the overshoot", /offset 999999 is past the end/.test(pastEnd) && /total is 46/.test(pastEnd), pastEnd.split("\n")[0]);
+const clampedLimit = renderSearch({ items: [], total: 46, truncated: false, offset: 0, excluded: 3, limitClampedFrom: 0 });
+const plainLimit = renderSearch({ items: [], total: 46, truncated: false, offset: 0, excluded: 3 });
+check("A-a an out-of-range limit is reported, and an in-range page stays clean", /limit 0 is outside 1-300 and was clamped/.test(clampedLimit) && !/is outside 1-300/.test(plainLimit), clampedLimit.split("\n").join(" | "));
+const scopedTotal = renderSearch({ items: [], total: 46, truncated: false, offset: 0, excluded: 3 });
+check("A-d the total is labelled as the count before exclusion, only when rules apply", /total 46 is the count before exclusion/.test(scopedTotal) && !/before exclusion/.test(renderSearch({ items: [], total: 46, truncated: false, offset: 0, excluded: 0 })), scopedTotal.split("\n")[0]);
+const clampedRead = renderRead({ ref: "anytxt:7", mode: "full", text: "abc", totalChars: 3, returned: 3, offset: 0, truncated: false, maxClampedFrom: 40001 });
+check("A-c a clamped max is reported on a read, and an in-range read stays clean", /max 40001 is outside the range/.test(clampedRead) && !/is outside the range/.test(renderRead({ ref: "anytxt:7", mode: "full", text: "abc", totalChars: 3, returned: 3, offset: 0, truncated: false })), clampedRead.split("\n").pop());
+
+// A-c（fragments 侧）：`max` 是段数（1–8），钳位同样要留痕。只在 full 分支印提示的话，
+// `max: 0` / `max: 9` 被钳成 1 / 8 仍然一声不响——与 full 侧 `40001 -> 40000` 的待遇不一致。
+const clampedFragments = renderRead({ ref: "anytxt:7", mode: "fragments", query: "hit", totalSnippets: 8, snippets: ["alpha"], maxClampedFrom: 0 });
+const plainFragments = renderRead({ ref: "anytxt:7", mode: "fragments", query: "hit", totalSnippets: 8, snippets: ["alpha"] });
+check("A-c a clamped fragments max is reported, and an in-range fragment answer stays clean", /max 0 is outside the range/.test(clampedFragments) && !/is outside the range/.test(plainFragments), clampedFragments.split("\n").pop());
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;

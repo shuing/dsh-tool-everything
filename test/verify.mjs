@@ -135,7 +135,7 @@ try {
 	compileError = error;
 }
 check("the real tool definition compiles", compileError === void 0 && compiledTool?.name === "everything_search", compileError === void 0 ? "everything_search compiled" : `${compileError.code ?? compileError.name}: ${compileError.message}`);
-check("compiled parameters expose every documented argument", Object.keys(compiledTool?.parameters?.properties ?? {}).join(",") === "search,path,pathMustExist,maxResults,offset,exclude,sort,descending,countOnly,type", Object.keys(compiledTool?.parameters?.properties ?? {}).join(","));
+check("compiled parameters expose every documented argument", Object.keys(compiledTool?.parameters?.properties ?? {}).join(",") === "search,path,pathMustExist,allDrives,maxResults,offset,exclude,sort,descending,countOnly,type", Object.keys(compiledTool?.parameters?.properties ?? {}).join(","));
 check("only search is required", Array.isArray(compiledTool?.parameters?.required) && compiledTool.parameters.required.length === 1 && compiledTool.parameters.required[0] === "search", JSON.stringify(compiledTool?.parameters?.required));
 // 0.4.8-1：README 参数表与编译出的 schema 互校——十个参数一个都不能漏，以后加参数不更
 // 文档先红。顺带钉住两件文档漂过的事：maxResults 的默认值只指向常量、不写死 30（0.3.0
@@ -144,7 +144,7 @@ check("only search is required", Array.isArray(compiledTool?.parameters?.require
 const readmeParamSource = readRepoFile("README.md");
 const schemaParams = Object.keys(compiledTool?.parameters?.properties ?? {});
 const undocumentedParams = schemaParams.filter((name) => !readmeParamSource.includes("| `" + name + "` |"));
-check("README documents every parameter of the compiled schema", schemaParams.length === 10 && undocumentedParams.length === 0, undocumentedParams.length === 0 ? `${schemaParams.length} parameters documented` : `missing: ${undocumentedParams.join(", ")}`);
+check("README documents every parameter of the compiled schema", schemaParams.length === 11 && undocumentedParams.length === 0, undocumentedParams.length === 0 ? `${schemaParams.length} parameters documented` : `missing: ${undocumentedParams.join(", ")}`);
 check("README points at DEFAULT_MAX_RESULTS instead of pinning 30", /DEFAULT_MAX_RESULTS/.test(readmeParamSource) && !/默认\s*30/.test(readmeParamSource), "no hardcoded 30 default");
 check("README spells the three header forms out", readmeParamSource.includes("Found N of M results (offset X)") && readmeParamSource.includes("Found M results") && readmeParamSource.includes("shown N / total M / nextOffset X"), "header forms documented");
 // 内容侧三条工具的参数键集、required 与输出形状统一在下面「the anytxt tool face」
@@ -314,8 +314,9 @@ const anytxtReadParams = Object.keys(anytxtTools.get("anytxt_read")?.parameters?
 check("anytxt_read exposes exactly its five arguments", anytxtReadParams === "ref,mode,query,offset,max", anytxtReadParams);
 check("anytxt_read requires only ref", JSON.stringify(anytxtTools.get("anytxt_read")?.parameters?.required ?? []) === JSON.stringify(["ref"]), JSON.stringify(anytxtTools.get("anytxt_read")?.parameters?.required));
 check("anytxt_status takes no parameters", Object.keys(anytxtTools.get("anytxt_status")?.parameters?.properties ?? {}).length === 0, JSON.stringify(Object.keys(anytxtTools.get("anytxt_status")?.parameters?.properties ?? {})));
-// syncIndex 只有 folder 一个参数，且必填：三条实测坑（相对路径、纯正斜杠、目录不存在）都回 errno 0，
-// 校验只能落在插件侧，所以这条参数在 schema 上必须被标成必填。
+// syncIndex 只有 folder 一个参数，且必填：实测两种形态（无盘符路径、目录不存在）都回 errno 0，
+// 校验只能落在插件侧，所以这条参数在 schema 上必须被标成必填。正斜杠不在此列——它先归一成
+// 反斜杠（anytxt.verify.mjs 有一条钉这个），不属于「当场报错」的那一类。
 const anytxtSyncParams = Object.keys(anytxtTools.get("anytxt_sync_index")?.parameters?.properties ?? {}).join(",");
 check("anytxt_sync_index exposes exactly folder, and requires it", anytxtSyncParams === "folder" && JSON.stringify(anytxtTools.get("anytxt_sync_index")?.parameters?.required ?? []) === JSON.stringify(["folder"]), `${anytxtSyncParams} / ${JSON.stringify(anytxtTools.get("anytxt_sync_index")?.parameters?.required)}`);
 const anytxtSyncOutKeys = Object.keys(anytxtTools.get("anytxt_sync_index")?.output?.schema?.properties ?? {}).sort();
@@ -505,11 +506,29 @@ try {
 } catch (error) {
 	missingScopeMessage = error.message;
 }
-check("a missing scope names the nearest existing parent and the ways out", /nearest existing parent: C:\\/.test(missingScopeMessage) && /wildcard scope/.test(missingScopeMessage) && /omit path:/.test(missingScopeMessage) && /pathMustExist: false/.test(missingScopeMessage), missingScopeMessage);
+// 0.4.6-1 的三条出路里，通配 scope 那条已被实测推翻：`path:C:\x\*` 回 0 条、`path:C:\x`
+// 回 19 条，所以文案不再推荐它，断言也跟着改成「不许出现」。推荐的必须是一条真能走通的路。
+check("a missing scope names the nearest existing parent and the ways out", /nearest existing parent: C:\\/.test(missingScopeMessage) && !/wildcard scope/.test(missingScopeMessage) && /omit path:/.test(missingScopeMessage) && /pathMustExist: false/.test(missingScopeMessage), missingScopeMessage);
 // pathMustExist:false 才降级：scope 被丢掉、整盘照搜，并由 notes 回报、结果头明写。
 const ignoreNotes = {};
-const ignoredScopeSearch = buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42", pathMustExist: false }, [], ignoreNotes);
-check("pathMustExist:false drops the scope instead of throwing", ignoredScopeSearch === "*.dll" && ignoreNotes.ignoredScope === "C:\\definitely missing dir 42", `${ignoredScopeSearch} / ${ignoreNotes.ignoredScope}`);
+// 全盘回退要两次确认：`pathMustExist: false` 单独出现是参数错误（下面第二条断言），
+// 只有再加 `allDrives: true` 才真的丢掉 scope。漏路径就丢 scope 等于搜整个索引，实测 22541 条。
+const ignoredScopeSearch = buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42", pathMustExist: false, allDrives: true }, [], ignoreNotes);
+check("pathMustExist:false with allDrives:true drops the scope instead of throwing", ignoredScopeSearch === "*.dll" && ignoreNotes.ignoredScope === "C:\\definitely missing dir 42", `${ignoredScopeSearch} / ${ignoreNotes.ignoredScope}`);
+let halfConfirmedError;
+try {
+	buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42", pathMustExist: false });
+} catch (error) {
+	halfConfirmedError = error;
+}
+check("a missing scope with pathMustExist:false alone is rejected, naming allDrives", halfConfirmedError instanceof Error && /allDrives: true/.test(halfConfirmedError.message) && /whole-index fallback/.test(halfConfirmedError.message) && /nearest existing parent: C:\\/.test(halfConfirmedError.message), halfConfirmedError === void 0 ? "no error thrown" : halfConfirmedError.message);
+let allDrivesAloneError;
+try {
+	await compiledTool.execute({ search: "*.dll", allDrives: true }, { signal: new AbortController().signal });
+} catch (error) {
+	allDrivesAloneError = error;
+}
+check("allDrives without pathMustExist:false is rejected instead of doing nothing", allDrivesAloneError instanceof Error && /allDrives only authorises the whole-index fallback/.test(allDrivesAloneError.message), allDrivesAloneError === void 0 ? "no error thrown" : allDrivesAloneError.message);
 const ignoredScopeHeader = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, pathIgnored: "C:\\definitely missing dir 42" }).split("\n")[0];
 check("the header says a dropped path was ignored", /path ignored: does not exist/.test(ignoredScopeHeader), ignoredScopeHeader);
 // 0.4.7-2：type 渲染成 Everything 自己的 file:/folder:（零新 SDK 绑定，实测
@@ -522,17 +541,38 @@ const typeNotes = {};
 const conflictingTypeSearch = buildSearch({ search: "node_modules folder:", type: "file" }, [], typeNotes);
 const conflictingTypeHeader = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, typeIgnored: typeNotes.skippedType }).split("\n")[0];
 check("type is not re-appended when the search already filters", conflictingTypeSearch === "node_modules folder:" && typeNotes.skippedType === "file" && /type not appended/.test(conflictingTypeHeader), `${conflictingTypeSearch} / ${typeNotes.skippedType} / ${conflictingTypeHeader}`);
-// 一档第 1 条：带通配的 scope 是合法 Everything 写法，不许被存在性检查误杀——旧代码
-// 先 existsSync 再看通配，`path: "D:/code/*"` 必抛「path does not exist」。
+// 一档第 1 条：带通配的 scope 不许被存在性检查误杀（`D:` 盘在不在都不是参数错误）。
+// 同时尾部通配要被折叠：实测 `path:C:\x\*` 回 0 条、`path:C:\x` 回 19 条——Everything
+// 的 `path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。
 const wildcardScope = buildSearch({ search: "*.dll", path: "D:/code/*" });
-check("a wildcard scope is not stat-ed away", wildcardScope === "*.dll path:D:\\code\\*", wildcardScope);
+check("a wildcard scope is not stat-ed away and its trailing wildcard is collapsed", wildcardScope === "*.dll path:D:\\code\\", wildcardScope);
 let wildcardWithSpaces = "";
 try {
 	wildcardWithSpaces = buildSearch({ search: "*.dll", path: "C:/Program Files/*" });
 } catch (error) {
 	wildcardWithSpaces = `${error.message}`;
 }
-check("a wildcard scope with spaces stays quoted", wildcardWithSpaces === "*.dll path:\"C:\\Program Files\\*\"", wildcardWithSpaces);
+// 带空格的通配 scope：既要不报错、要加引号，尾部通配也要被折叠（`C:\x\*` 与 `C:\x\` 同义，
+// 前者实测回 0 条）。期望值随新契约改，不是为了让测试变绿。
+check("a wildcard scope with spaces stays quoted and loses its trailing wildcard", wildcardWithSpaces === "*.dll path:\"C:\\Program Files\\\"", wildcardWithSpaces);
+// scope 指向文件：实测 `*.md` + path=真实 .md 文件恒为 0 命中，且旧输出一句提示都没有
+// （给文件补了尾分隔符）。path 只收目录，所以这里必须是显式参数错误、并给出两条出路。
+// 样本用 process.execPath：绝对路径、必然存在、必然是文件，不硬编码仓库位置。
+let fileScopeError;
+try {
+	buildSearch({ search: "*.dll", path: process.execPath });
+} catch (error) {
+	fileScopeError = error;
+}
+check("a file path as scope is rejected, naming the directory-only rule and both ways out", fileScopeError instanceof Error && /path must be a directory, not a file/.test(fileScopeError.message) && /parent directory/.test(fileScopeError.message) && /ext:/.test(fileScopeError.message), fileScopeError === void 0 ? "no error thrown" : fileScopeError.message);
+// 通配 scope 不走这条校验：通配串没有可 stat 的对象，误杀会把合法写法变成参数错误。
+let wildcardFileLikeThrew = "";
+try {
+	wildcardFileLikeThrew = buildSearch({ search: "*.dll", path: "C:/Program Files/*" });
+} catch (error) {
+	wildcardFileLikeThrew = `THREW: ${error.message}`;
+}
+check("a wildcard scope is never stat-ed by the file check", !wildcardFileLikeThrew.startsWith("THREW:"), wildcardFileLikeThrew);
 
 const truncatedHeader = formatOutput({
 	items: [{ path: "C:\\a.txt", folder: false, size: 10 }],
@@ -558,6 +598,11 @@ const statsLines = formatOutput({
 check("the header carries shown/total/nextOffset", statsLines[1] === "shown 5 / total 50 / nextOffset 5", statsLines.slice(0, 2).join(" | "));
 const lastPageText = formatOutput({ items: [{ path: "C:\\a.txt", folder: false, size: 1, mtime: -1 }], total: 1, truncated: false, dbLoaded: true });
 check("a last page prints a dash for nextOffset", /^shown 1 \/ total 1 \/ nextOffset -$/m.test(lastPageText), lastPageText.split("\n")[1]);
+// 空页（offset 越过 total）不许印成全量：total 大于 0 而这一页为空时，`Found 0 of 15 results`
+// 会被读成「这个范围里什么都没有」，读的人不会再往里翻。实测 offset:100 / total:15 就是这样，
+// 旧输出一句提示都没有。
+const pastEndText = formatOutput({ items: [], total: 15, truncated: false, offset: 100, dbLoaded: true });
+check("an empty page past the end names the overshoot", /offset 100 is past the end/.test(pastEndText) && /total is 15/.test(pastEndText), pastEndText.split("\n")[0]);
 // 显示层契约：countOnly 的 header 只报数，不进 offset 分支（旧版冒出「pass offset 0」）。
 const countOnlyText = formatOutput({
 	items: [],
@@ -569,18 +614,28 @@ const countOnlyText = formatOutput({
 	excluded: 0
 });
 check("countOnly prints a count, not an offset page", countOnlyText.split("\n")[0] === "Found 15712 matches (count only)" && !/pass offset/.test(countOnlyText) && /list the paths/.test(countOnlyText) && !/shown /.test(countOnlyText), countOnlyText.split("\n")[0]);
-// 搬输出：三条红线从工具 description 搬到运行时输出，每条都要有看守（原实现里 `not in
-// index` 全仓 0 处，搬过去等于无人看守）。A1–A5 逐条对应门控，尾追加一律不会碰到上面
-// 钉 shown 行或 countOnly 首行的那几条精确等值。
+// 搬输出：红线从工具 description 搬到运行时输出，每条都要有看守。A1–A5 逐条对应门控，
+// 尾追加一律不会碰到上面钉 shown 行或 countOnly 首行的那几条精确等值。
+//
+// 0 命中有两组注记——头行的边界尾注、页脚的「放宽」出路——它们共用同一组门控，所以
+// 守门也必须共用一把尺子。旧写法把守卫写成 `!/not in index/`：措辞一改，正则再也匹配
+// 不到任何东西，「该不出现时必须不出现」就静默失效（测试照样绿，但已经不管事）。
+const hasZeroAnnotation = (text) => /no match in the index/.test(text) || /widen:/.test(text);
 const zeroLoadedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true });
-check("a zero-hit first line says not in index, never missing", zeroLoadedText.split("\n")[0] === "Found 0 results = not in index (≠ missing)", zeroLoadedText.split("\n")[0]);
+check("a zero-hit first line names the index boundary without the word missing", zeroLoadedText.split("\n")[0] === "Found 0 results = no match in the index (indexed volumes only)" && !/missing/i.test(zeroLoadedText), zeroLoadedText.split("\n")[0]);
 const zeroCountOnlyText = formatOutput({ items: [], total: 0, truncated: false, countOnly: true, dbLoaded: true });
-check("countOnly never carries the not-in-index tail", zeroCountOnlyText.split("\n")[0] === "Found 0 matches (count only)" && !/not in index/.test(zeroCountOnlyText), zeroCountOnlyText.split("\n")[0]);
+check("countOnly carries neither the boundary tail nor the widen footer", zeroCountOnlyText.split("\n")[0] === "Found 0 matches (count only)" && !hasZeroAnnotation(zeroCountOnlyText), zeroCountOnlyText.split("\n")[0]);
 const zeroUnloadedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: false });
-check("an unloaded index points at everything_status instead of concluding", /→ call everything_status/.test(zeroUnloadedText.split("\n")[0]) && !/not in index/.test(zeroUnloadedText), zeroUnloadedText.split("\n")[0]);
+check("an unloaded index points at everything_status instead of concluding", /→ call everything_status/.test(zeroUnloadedText.split("\n")[0]) && !hasZeroAnnotation(zeroUnloadedText), zeroUnloadedText.split("\n")[0]);
 const zeroScopedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, pathIgnored: "C:\\missing-42" });
 const zeroTypedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, typeIgnored: "file" });
-check("a rewritten scope keeps the not-in-index tail off", !/not in index/.test(zeroScopedText) && !/not in index/.test(zeroTypedText), `${zeroScopedText.split("\n")[0]} | ${zeroTypedText.split("\n")[0]}`);
+check("a rewritten scope keeps both zero-hit annotations off", !hasZeroAnnotation(zeroScopedText) && !hasZeroAnnotation(zeroTypedText), `${zeroScopedText.split("\n")[0]} | ${zeroTypedText.split("\n")[0]}`);
+// 0 命中必须有下一步：与截断页脚的 narrow 对称，给一条「放宽」的出路。排除规则是零命中的
+// 一个常见成因，而且条数已经写在头行，所以当次生效时把 exclude:"" 一并给出。
+const zeroWithExclusions = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, excluded: 3 });
+const zeroWithoutExclusions = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, excluded: 0 });
+check("a zero-hit page offers a way to widen, symmetric with the truncation footer", /widen: drop path:, drop ext:, or relax the pattern/.test(zeroWithExclusions) && /widen:/.test(zeroWithoutExclusions), zeroWithExclusions.split("\n").pop());
+check("the widen footer names the exclude escape only when exclusion rules were in force", /exclude:""/.test(zeroWithExclusions) && !/exclude:""/.test(zeroWithoutExclusions), JSON.stringify([zeroWithExclusions.split("\n").pop(), zeroWithoutExclusions.split("\n").pop()]));
 const noNextOffsetFooter = formatOutput({ items: [{ path: "C:\\a.txt", folder: false, size: 1, mtime: -1 }], total: 9, truncated: true, offset: 0, dbLoaded: true });
 check("a truncated page without nextOffset still pages by offset, never by maxResults", /pass offset \d/.test(noNextOffsetFooter) && !/raise maxResults/.test(noNextOffsetFooter) && !/Showing the first/.test(noNextOffsetFooter), noNextOffsetFooter.split("\n").pop());
 check("the dead 'Showing the first' footer is gone from the formatter", !/Showing the first/.test(readRepoFile("lib/shared/format.mjs")), "lib/shared/format.mjs carries no 'Showing the first' footer");
@@ -1067,6 +1122,169 @@ check("a path parameter plus a path: term is a named argument error, never silen
 // 非整数 / 越界一律回退默认，不许以一条没有 ANYTXT_* 错误码的裸 RangeError 逃出。
 const badCaps = faceModule.anytxt.resolveContentCaps({ anytxtTimeoutMs: -1, anytxtSyncTimeoutMs: 15000.5, anytxtMaxResults: 1e9 });
 check("a bad component-row budget falls back to its default instead of a bare RangeError", badCaps.anytxtTimeoutMs === 15000 && badCaps.anytxtSyncTimeoutMs === 60000 && badCaps.anytxtMaxResults === 300, `${badCaps.anytxtTimeoutMs}/${badCaps.anytxtSyncTimeoutMs}/${badCaps.anytxtMaxResults}`);
+
+// --- 0.5.1：清单第 4 节 P0-1 / P1-1 / P1-2 / P2-1 的固化断言 ---
+// P0-1：`name*` 前缀通配曾被当字面前缀（实测 0 条），又因为带 `*` 跳过全部路径校验——
+// 一处「参数错误伪装成没有匹配」。现在 `dir\*`、`dir\**`、`name*` 一并归一到静态前缀，
+// 交给 `path:` 自己的前缀匹配；父目录都不存在的通配 scope 必须走路径类报错。
+const scopeDir = path.join(repoRoot, "lib");
+const scopeOf = (pathValue) => buildSearch({ search: "*.md", path: pathValue });
+const directScope = scopeOf(scopeDir);
+// 尾部通配分两种形态，不能合并成一条：`dir\*`／`dir\**` 是「该目录下全部」，等价于直连目录
+// （补尾分隔符）；`name*` 是名字前缀，补了分隔符就变成「这个精确目录」，把 `dsh-voice-s*`
+// 逼回 0 条（实测直连 `dsh-voice-suite-main` 有 1 个 .md）。两条各钉各的形态。
+check("a directory slash wildcard folds to the direct scope", directScope === `*.md path:${scopeDir}\\` && scopeOf(`${scopeDir}\\*`) === directScope && scopeOf(`${scopeDir}\\**`) === directScope, `${scopeOf(`${scopeDir}\\*`)} | ${scopeOf(`${scopeDir}\\**`)} | direct ${directScope}`);
+check("a name-prefix wildcard keeps the prefix and takes no trailing separator", scopeOf(`${scopeDir}*`) === `*.md path:${scopeDir}`, scopeOf(`${scopeDir}*`));
+// 中间通配（`C:\a*\b`）没有可证明的等价物，必须原样保留——否则一次前缀匹配会被改成精确目录。
+check("a wildcard in the middle of a scope is left alone", scopeOf("C:/a*/b") === "*.md path:C:\\a*\\b", scopeOf("C:/a*/b"));
+let wildcardMissingParent;
+try {
+	buildSearch({ search: "*.md", path: path.join(repoRoot, "no-such-dir-42", "anything*") });
+} catch (error) {
+	wildcardMissingParent = error;
+}
+check("a wildcard scope under a missing parent is a path error, not a silent zero", wildcardMissingParent instanceof Error && /path does not exist/.test(wildcardMissingParent.message) && /nearest existing parent: C:\\/.test(wildcardMissingParent.message), wildcardMissingParent === void 0 ? "no error thrown" : wildcardMissingParent.message);
+
+// P1-1：负数 offset 必须当场报参数错误，不许静默变成第 0 页（旧行为 `offset:-9` 回
+// `Found 2 of 15 results (offset 0)`，一句提示都没有，与 maxResults 的四个越界值不对称）。
+let negativeOffsetError;
+try {
+	await compiledTool.execute({ search: "*.dll", offset: -5 }, { signal: new AbortController().signal });
+} catch (error) {
+	negativeOffsetError = error;
+}
+check("a negative offset is a named argument error, never a silent clamp", negativeOffsetError instanceof Error && /offset must be >= 0/.test(negativeOffsetError.message) && /got -5/.test(negativeOffsetError.message), negativeOffsetError === void 0 ? "no error thrown" : negativeOffsetError.message);
+
+// P2-1：`ext:` 空值语义未定义且静默（实测 5 / 1 / 0，既不是「无过滤」也不是错误），现在拒绝。
+let emptyExtError;
+try {
+	parseArgs({ search: "ext:" });
+} catch (error) {
+	emptyExtError = error;
+}
+check("an empty ext: clause is an argument error, not an undefined count", emptyExtError instanceof Error && /ext: requires a value/.test(emptyExtError.message), emptyExtError === void 0 ? "no error thrown" : emptyExtError.message);
+let bareExtStillWorks = false;
+try {
+	bareExtStillWorks = parseArgs({ search: "ext:md" }).search === "ext:md" && parseArgs({ search: "*.md ext:md;txt" }).search.endsWith("ext:md;txt");
+} catch {
+	bareExtStillWorks = false;
+}
+check("an ext: clause with a value still passes", bareExtStillWorks, "ext:md and ext:md;txt both accepted");
+
+// P1-2：头部契约的形态钉死。历史上同参 `maxResults:10, offset:10` 在轮 3 返回过
+// `Found 15 results`（`of` 与 `offset` 双双消失），是跨轮／跨加载漂移，人工复测抓不住，
+// 只能靠固化断言。四种页形里三种必须匹配同一个正则；countOnly 走自己那条已文档化的
+// 形态（`Found N matches (count only)`，另有精确等值断言钉着），这里显式断它不匹配分页正则。
+const HEADER_SHAPE = /^Found \d+ of \d+ results \(offset \d+\)/;
+const pagedPage = (offset, shown, total, truncated) => formatOutput({
+	items: Array.from({ length: shown }, (_unused, index) => ({ path: `C:\\f${index}.md`, folder: false, size: 10, mtime: -1 })),
+	total,
+	truncated,
+	offset,
+	nextOffset: truncated ? offset + shown : void 0,
+	dbLoaded: true,
+	excluded: 3
+});
+const fullPage = pagedPage(7, 7, 20, true);
+const tailPage = pagedPage(15, 5, 20, false);
+const emptyPage = pagedPage(20, 0, 20, false);
+const pastEndPage = pagedPage(40, 0, 20, false);
+check("the four page shapes keep the header contract", [fullPage, tailPage, emptyPage, pastEndPage].every((text) => HEADER_SHAPE.test(text.split("\n")[0])) && !HEADER_SHAPE.test(pagedPage(0, 0, 20, false).replace("Found 0 matches (count only)", "")) && /count only/.test(formatOutput({ items: [], total: 20, truncated: false, countOnly: true, dbLoaded: true }).split("\n")[0]), [fullPage, tailPage, emptyPage, pastEndPage].map((text) => text.split("\n")[0]).join(" | "));
+check("the tail page and the empty page both print a dash for nextOffset", /^shown 5 \/ total 20 \/ nextOffset -$/m.test(tailPage) && /^shown 0 \/ total 20 \/ nextOffset -$/m.test(emptyPage), `${tailPage.split("\n")[1]} | ${emptyPage.split("\n")[1]}`);
+let headerDriftRound = -1;
+for (let round = 0; round < 20; round++) {
+	if (![fullPage, tailPage, emptyPage, pastEndPage].every((text) => HEADER_SHAPE.test(text.split("\n")[0]))) {
+		headerDriftRound = round;
+		break;
+	}
+}
+check("the header shape holds over 20 consecutive renders", headerDriftRound === -1, headerDriftRound === -1 ? "20/20 identical shape" : `drifted at round ${headerDriftRound}`);
+
+// P1-3：通配 scope 20 次压测。同写法 `...\\default-workspace\\*` 在轮 2/3/4 给过 1 / 0 / 0，
+// 单轮成功不算证据。基线取直连目录的真机计数，四种写法各跑 20 次，逐次与基线相等。
+await live("wildcard spellings answer the identical count 20 times in a row", async () => {
+	const countFor = async (scopeValue) => (await runQuery(exec, { search: "*", path: scopeValue }, { ...base, maxResults: 1, exclude: [], countOnly: true })).total;
+	const directTotal = await countFor(scopeDir);
+	assert.ok(directTotal > 0, `the direct scope answered ${directTotal}`);
+	const spellings = [scopeDir, `${scopeDir}*`, `${scopeDir}\\*`, `${scopeDir}\\**`];
+	const report = [];
+	for (const spelling of spellings) {
+		const totals = [];
+		for (let round = 0; round < 20; round++) totals.push(await countFor(spelling));
+		// 两种尾部形态不能共用一个期望值：`dir\*`／`dir\**` 折成该目录自身，必须等于直连基线；
+		// `name*` 是纯字符串前缀，Everything 的 path: 连目录自身也匹配（实测 lib 前缀 24、直连 23），
+		// 所以它只判「20 次恒等且 >= 直连」——那是前缀语义，不是漂移。
+		const exactForm = spelling === scopeDir || spelling.slice(scopeDir.length).startsWith(String.fromCharCode(92));
+		if (exactForm) assert.deepEqual(totals, Array.from({ length: 20 }, () => directTotal), `${spelling} drifted: ${JSON.stringify(totals)} (direct baseline ${directTotal})`);
+		else {
+			assert.equal(new Set(totals).size, 1, `${spelling} name-prefix drifted: ${JSON.stringify(totals)}`);
+			assert.ok(totals[0] >= directTotal, `${spelling} answered ${totals[0]}, below the direct baseline ${directTotal}`);
+		}
+		report.push(`${spelling === scopeDir ? "direct" : spelling.slice(scopeDir.length)} ${directTotal}x20`);
+	}
+	return report.join(", ");
+});
+
+// --- 0.5.2：清单 v5 第 5 节「改成常驻测试」两项 ---
+// FIX-11：9 种页形的头部契约（数值取清单第 6 节 H1–H9）。首行按前缀比，因为排除条数是合法
+// 后缀；shown 行逐字比。两个边界必须这样钉：恰好用尽给 `-`（给 15 会让调用方白翻一页空页）、
+// 子目录中页给 4（证明 `-` 不是到处乱给）。
+const shapeRows = [
+	["H1 full page", 8, 7, 15, "-", "Found 7 of 15 results (offset 8)"],
+	["H2 tail page", 11, 4, 15, "-", "Found 4 of 15 results (offset 11)"],
+	["H3 tail page", 12, 3, 15, "-", "Found 3 of 15 results (offset 12)"],
+	["H4 last item", 14, 1, 15, "-", "Found 1 of 15 results (offset 14)"],
+	["H5 exactly used up", 6, 9, 15, "-", "Found 9 of 15 results (offset 6)"],
+	["H6 offset equals total", 15, 0, 15, "-", "Found 0 of 15 results (offset 15)"],
+	["H7 far past the end", 99, 0, 15, "-", "Found 0 of 15 results (offset 99)"],
+	["H8 subdirectory middle page", 2, 2, 5, "4", "Found 2 of 5 results (offset 2)"],
+	["H9 sibling of H3", 10, 5, 15, "-", "Found 5 of 15 results (offset 10)"]
+];
+const shapeFailures = [];
+for (const [label, offset, shown, total, nextOffset, head] of shapeRows) {
+	const text = formatOutput({
+		items: Array.from({ length: shown }, (_unused, index) => ({ path: `C:\\f${index}.md`, folder: false, size: 10, mtime: -1 })),
+		total,
+		truncated: false,
+		offset,
+		nextOffset: nextOffset === "-" ? void 0 : Number(nextOffset),
+		dbLoaded: true
+	});
+	const first = text.split("\n")[0];
+	const statsLine = text.split("\n")[1];
+	if (!first.startsWith(head)) shapeFailures.push(`${label} header: ${first}`);
+	if (statsLine !== `shown ${shown} / total ${total} / nextOffset ${nextOffset}`) shapeFailures.push(`${label} stats: ${statsLine}`);
+}
+check("the nine page shapes keep the header contract", shapeFailures.length === 0, shapeFailures.length === 0 ? "9/9 header + stats lines exact" : shapeFailures.join(" | "));
+// H9 的同参重复：同一调用连发 20 次必须逐字节一致（历史漂移是跨轮次的，只能在这里钉）。
+const h9Texts = new Set(Array.from({ length: 20 }, () => formatOutput({
+	items: Array.from({ length: 5 }, (_unused, index) => ({ path: `C:\\f${index}.md`, folder: false, size: 10, mtime: -1 })),
+	total: 15,
+	truncated: false,
+	offset: 10,
+	dbLoaded: true
+})));
+check("one page shape renders byte-identically 20 times", h9Texts.size === 1, `${h9Texts.size} distinct rendering(s) over 20 renders`);
+
+// FIX-10：清单的另外两种等价写法（正斜杠、尾分隔符）与直连目录同数，各 20 次。
+// 上一轮只覆盖了直连、`*`、`\*`、`\**` 四种，这里补齐 T 组的另两种。
+await live("the forward-slash and trailing-separator spellings answer the direct count 20 times", async () => {
+	const countFor = async (scopeValue) => (await runQuery(exec, { search: "*", path: scopeValue }, { ...base, maxResults: 1, exclude: [], countOnly: true })).total;
+	const directTotal = await countFor(scopeDir);
+	assert.ok(directTotal > 0, `the direct scope answered ${directTotal}`);
+	const spellings = [
+		["forward slash", `${scopeDir.replace(/\\/g, "/")}/*`],
+		["trailing separator", `${scopeDir}\\`]
+	];
+	const report = [];
+	for (const [label, spelling] of spellings) {
+		const totals = [];
+		for (let round = 0; round < 20; round++) totals.push(await countFor(spelling));
+		assert.deepEqual(totals, Array.from({ length: 20 }, () => directTotal), `${label} drifted: ${JSON.stringify(totals)} (direct baseline ${directTotal})`);
+		report.push(`${label} ${directTotal}x20`);
+	}
+	return report.join(", ");
+});
 
 console.log(`\n${passed} passed, ${skipped} skipped, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;
