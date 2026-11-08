@@ -1,7 +1,7 @@
 # dsh-tool-everything
 
 > 🔀 **本仓库是 [roxyyn0304/dsh-tool-everything](https://github.com/roxyyn0304/dsh-tool-everything) 的 fork**，
-> 在上游  的基础上继续维护；本 fork 相对上游改了什么见下文
+> 在上游 `0.4.14` 的基础上继续维护；本 fork 相对上游改了什么见下文
 > 「🔀 本 fork 相对上游的差异」一节。
 > 代码以 MIT 许可发布，**原始版权归原作者 roxyyn0304 所有**，上游 [LICENSE](LICENSE) 原文保留未改。
 
@@ -292,6 +292,8 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 | `EVERYTHING_WORKER_FAILED` | worker 内部抛错（错误分支与启动失败同码） |
 | `EVERYTHING_WORKER_EXITED` | worker 在回答前退出；下一次调用会新建一个 |
 | `EVERYTHING_WORKER_REPLACED` | `apply()` 重载换掉旧 worker，被中断的那条请求以此码结束 |
+| `EVERYTHING_QUERY_TIMEOUT` | 看门狗超时（早于宿主的工具预算）。原生查询无法取消，所以 `SIGKILL` 掉承载它的**子进程**，让 SDK 的进程级查询锁随进程一起消失，下一次调用起一个干净的子进程。宿主超时时**不会**触发 `exec.signal`（实测），所以只有这条看门狗能保证释放 |
+| `EVERYTHING_QUERY_POISONED` | 连续两次看门狗超时后运行时报废：杀掉子进程仍未释放锁。此后每次调用立刻失败，恢复方式是重启 DSH 服务进程——**重载插件无效**（实测：完整卸载+重载后仍超时） |
 | `EVERYTHING_READY` | `everything_status` 的判决：索引已加载，搜索可用（`ok: true`） |
 | `EVERYTHING_INDEX_NOT_LOADED` | `everything_status` 的判决：Everything 在应答，但索引尚未加载，搜索答不了 |
 | `STATUS_SKIPPED` | `everything_status` 的探活自身没在预算内答；不代表引擎 DOWN |
@@ -428,7 +430,7 @@ MIT。**原始版权归原作者 [roxyyn0304](https://github.com/roxyyn0304/dsh-
 
 ## 🙏 致谢
 
-- [roxyyn0304](https://github.com/roxyyn0304/dsh-tool-everything) — **本插件的原作者**，本 fork 基于他的 
+- [roxyyn0304](https://github.com/roxyyn0304/dsh-tool-everything) — **本插件的原作者**，本 fork 基于他的 `0.4.14`
 - [voidtools](https://www.voidtools.com) — Everything 文件搜索引擎
 - [koffi](https://koffi.dev) — Node.js FFI 库
 - [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) — DSH Agent 框架

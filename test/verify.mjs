@@ -917,6 +917,24 @@ const fakeRow = (label) => {
 const rowA = fakeRow("A");
 const rowB = fakeRow("B");
 const ROW_CONFIG = { maxResults: 100, timeoutMs: SEARCH_TIMEOUT_MS };
+/**
+ * How long a `Promise.race` here waits for a query to settle.
+ *
+ * Was 100/150 ms, calibrated for the worker-*thread* design: a thread reused the
+ * DLL already mapped in the host process, so a fresh worker had almost no start-up
+ * cost. Queries now run in a **child process** (that is what lets a stuck native
+ * call be SIGKILLed - see `workerProcess` in lib/components/everything/index.js),
+ * and one Node process start-up costs ~190 ms on this machine: measured bare
+ * `node -e ""` at 189-196 ms over repeated runs, with an empty NODE_OPTIONS, while
+ * loading koffi, `@deepseek-ai/dsh-llm` and the DLL on top added nothing measurable
+ * (191-202 ms). So the first query after `replace()` must wait out one process
+ * start.
+ *
+ * Only the waiting budget moves. Every assertion these races feed - that a reload
+ * settles *only* its own row's request, that an abort still reports SEARCH_ABORTED,
+ * that the fresh worker answers - is unchanged.
+ */
+const QUERY_SETTLE_BUDGET_MS = 2000;
 
 await live("an apply() reload settles only its own row's in-flight request", async () => {
 	await faceModule.everything.apply(rowA.ctx, ROW_CONFIG);
@@ -927,7 +945,7 @@ await live("an apply() reload settles only its own row's in-flight request", asy
 	const settled = pending.then((found) => ({ resolved: found }), (error) => ({ code: error?.code, message: error?.message }));
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	await faceModule.everything.apply(rowA.ctx, ROW_CONFIG);
-	const outcome = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 100))]);
+	const outcome = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), QUERY_SETTLE_BUDGET_MS))]);
 	assert.equal(outcome.code, "EVERYTHING_WORKER_REPLACED", `the in-flight request did not reject as replaced: ${JSON.stringify(outcome).slice(0, 160)}`);
 	assert.notEqual(runtimeFor(rowA.ctx), firstRuntime, "a reload must register a fresh runtime instead of reusing the old object");
 	const after = await runtimeFor(rowA.ctx).runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [] });
@@ -948,7 +966,7 @@ await live("another row's apply() leaves an in-flight request alone", async () =
 	const settled = pending.then((found) => ({ resolved: found }), (error) => ({ code: error?.code, message: error?.message }));
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	await faceModule.everything.apply(rowB.ctx, ROW_CONFIG);
-	const outcome = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 150))]);
+	const outcome = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), QUERY_SETTLE_BUDGET_MS))]);
 	assert.ok(outcome.resolved !== void 0, `row B's reload touched row A's in-flight request: ${JSON.stringify(outcome).slice(0, 160)}`);
 	assert.equal(outcome.code, void 0, `row A's request was settled with ${outcome.code}`);
 	assert.deepEqual(outcome.resolved.items.map((item) => item.path), serialPaths, "row A's items differ from the serial baseline taken before row B reloaded");
