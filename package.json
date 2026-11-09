@@ -2,7 +2,7 @@
   "name": "dsh-tool-everything",
   "//exports": "子路径通配是兼容兜底，非组件入口；3b／3c 搬文件后重核是否仍够用。",
   "description": "Model-facing Windows search tool backed by the Everything index (Everything64.dll FFI via koffi)",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

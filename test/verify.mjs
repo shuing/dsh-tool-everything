@@ -181,11 +181,17 @@ const promptText = promptSection?.text ?? "";
 // 0.4.11：文案只留两处唯一来源——工具 description（语法与跨参数规则）与各参数 description；
 // prompt 只剩用途分工与汇报纪律。断言跟着文案走，钉在唯一那份上，标准一条不放宽。
 const toolDoc = compiledTool?.description ?? "";
-check("the tool description teaches sort/countOnly/mtime", toolDoc.length > 0 && ["sort", "countOnly", "mtime"].every((word) => toolDoc.includes(word)) && /descending/.test(toolDoc), `${toolDoc.length} chars in the tool description, sort/descending/countOnly/mtime present`);
+// 0.5.2：定义只讲「谁干什么」，sort / descending / countOnly 的用法在各自的参数 description 里，
+// 主 description 不再复述。断言跟着文案走，钉在唯一那份上。
+const paramDocOf = (key) => compiledTool?.parameters?.properties?.[key]?.description ?? "";
+check("the parameter descriptions teach sort/descending/countOnly", paramDocOf("sort").length > 0 && /dateModified/.test(paramDocOf("sort")) && /sort:/.test(paramDocOf("descending")) && /total/.test(paramDocOf("countOnly")) && /mtime/.test(toolDoc), `${paramDocOf("sort").length} chars in sort, ${paramDocOf("descending").length} in descending, ${paramDocOf("countOnly").length} in countOnly, mtime in tool description ${/mtime/.test(toolDoc)}`);
 // 0.4.6-2：regex 的引号形态是既有能力（lib/index.js 的 regex 解析从 0.3.0 就支持），漂的是文案。
 // 0.4.11 起唯一那份在工具 description：钉住它必须教引号形态、且不许写「ends at its first space」
 // 这种绝对话；prompt 只负责把「内容检索归 grep」这条分工讲清。
-check("the docs teach the quoted regex: form, not a space cutoff", toolDoc.includes("regex:\"") && /double-quoted/.test(toolDoc) && !/ends at its first space/i.test(toolDoc) && promptText.includes("grep"), `desc quoted ${toolDoc.includes("regex:\"")}, double-quoted ${/double-quoted/.test(toolDoc)}, prompt grep ${promptText.includes("grep")}`);
+// 0.5.2：regex: 的引号形态现在只在 search 参数 description 里教（主 description 不再枚举算子细节），
+// 所以取值目标换成 searchDoc；不再要求出现字面量 regex:"（现行文案是 "double-quoted ... pattern"）。
+const searchDoc = compiledTool?.parameters?.properties?.search?.description ?? "";
+check("the docs teach the quoted regex: form, not a space cutoff", /regex:/.test(searchDoc) && /double-quoted/.test(searchDoc) && !/ends at its first space/i.test(searchDoc) && promptText.includes("grep"), `search param regex ${/regex:/.test(searchDoc)}, double-quoted ${/double-quoted/.test(searchDoc)}, prompt grep ${promptText.includes("grep")}`);
 // 文案互校：descending 的 schema 描述、prompt 段、sdk.sortValueFor 三处必须同口径——
 // sort 缺省时 descending:true 就是 name 降序（默认序反序），不是「忽略」。原先 schema
 // 描述写着 Ignored when，跟实现正好相反，而这种矛盾只有人眼比对才发现，所以钉成断言。
@@ -193,13 +199,18 @@ const descendingDoc = compiledTool?.parameters?.properties?.descending?.descript
 // 「not ignored」是正确措辞本身要用的短语，先剔除再查残留的 ignored，否则这条断言
 // 会把正确文案判成违规（第一版就是这么红的）。禁的是「Ignored when sort is omitted」。
 const descendingDocResidual = descendingDoc.replace(/not ignored/gi, "");
-check("descending's schema text says name descending, never ignored", /name descending/.test(descendingDoc) && !/ignored/i.test(descendingDocResidual), descendingDoc);
-check("schema text and tool description agree on bare descending", /name descending/.test(descendingDoc) && /name[- ]descending/.test(toolDoc), `${descendingDoc.slice(0, 60)}… / tool description ${/name[- ]descending/.test(toolDoc)}`);
+// 0.5.2：descending 的参数 description 只给两个搭配示例（配 dateModified 取最新、配 size 取最大），
+// 「sort 缺省即 name 降序」属实现口径、不再写进静态文本；行为由下面裸 descending 的 1/2 实测断言钉住。
+// 这里只守两件事：示例真的在，且任何一处静态文本都不许再写 ignored。
+check("descending's schema text teaches how to pair it", descendingDoc.length > 0 && /sort:dateModified/.test(descendingDoc) && /sort:size/.test(descendingDoc), descendingDoc);
+check("no static text claims descending is ignored", !/ignored/i.test(descendingDocResidual) && !/ignored/i.test(toolDoc), `descending param ${/ignored/i.test(descendingDocResidual)}, tool description ${/ignored/i.test(toolDoc)}; behaviour stays pinned by the measured 1/2 assertion`);
 // 0.4.8-2：prompt 补报告纪律与 dbLoaded 条件句。钉两件事：报告三段（命中概况 → 已核验\n// 路径 → 后续动作）与「候选，未核验」标注真的在；dbLoaded 只能是条件句——工具没有\n// 探测服务的能力，写成「先确认服务在运行」就是教模型做它做不到的事。\ncheck("the prompt carries the report discipline and the verified-path rule", /Report in three steps/.test(promptText) && /candidate, unverified/.test(promptText) && /read or glob/.test(promptText), `${promptText.length} chars, three-step report present`);
 // 前提变了：0.4.14 起有了 everything_status，工具 description 里那句「this tool cannot probe」
 // 就是假话，断言必须跟着事实走——钉「搜索本身不探活、探测归 everything_status」，
 // 「先确认服务在运行」仍然是禁区（那是教模型做它做不到的事）。
-check("dbLoaded is taught as a condition, probing belongs to everything_status", /dbLoaded/.test(toolDoc) && /a search never probes/.test(toolDoc) && /everything_status/.test(toolDoc) && !/confirm the Everything service is running/i.test(toolDoc), `dbLoaded ${/dbLoaded/.test(toolDoc)}, search never probes ${/a search never probes/.test(toolDoc)}, everything_status ${/everything_status/.test(toolDoc)}`);
+// 0.5.2：探活分工现在由 prompt 段（Index up? ask everything_status）与运行时的 index is not loaded yet
+// 追加句承担，工具 description 不再复述；禁的仍是「先确认服务在运行」这种教模型做它做不到的事。
+check("probing belongs to everything_status, and no static text tells the model to check the service", /everything_status/.test(promptText) && !/confirm the Everything service is running/i.test(toolDoc) && !/confirm the Everything service is running/i.test(promptText), `prompt everything_status ${/everything_status/.test(promptText)}, forbidden wording in tool ${/confirm the Everything service is running/i.test(toolDoc)} / prompt ${/confirm the Everything service is running/i.test(promptText)}`);
 // 0.4.11：prompt 只剩「用途分工 + 汇报纪律」两句半，语法与跨参数规则归工具 description、
 // 细则归各参数 description。上限从 1400 压到 400——以后谁想往 prompt 里堆句子，先删一句。
 // 0.4.15：按用户要求在最前面加 B 版两行「工作前先搜一遍 / 缺东西先搜」（+161 字符，374 → 535），
@@ -208,10 +219,10 @@ check("the prompt section stays within its 560-character budget", promptText.len
 // 0.4.13：toolDoc 六段化后实测 1442 字符，钉一个 1600 的上限——工具 description 每轮都在上下文里，
 // 与 prompt 一样会靠堆句子长回去，这条逼以后谁想加一句先删一句。
 check("the tool description stays within its 1600-character budget", toolDoc.length > 0 && toolDoc.length <= 1600, `${toolDoc.length} chars in the tool description`);
-// 0.4.13：六段段名与顺序钉死（Usage → Principle → Constraints → Semantics → Report → Scope），
-// 参数在前、报告在后；有人把段名写成单数或打乱顺序，这条先红。
-const sectionOrder = ["Usage:", "Principle:", "Constraints:", "Semantics:", "Report:", "Scope:"].map((label) => toolDoc.indexOf(label));
-check("the tool description keeps the six sections in order", sectionOrder.every((index) => index >= 0) && sectionOrder.every((index, position) => position === 0 || index > sectionOrder[position - 1]), JSON.stringify(sectionOrder));
+// 0.5.2：定义只剩五段（Usage → Principle → Semantics → Report → Scope），原先的 Constraints 整段
+// 搬进运行时输出，段名表跟着删一项；参数在前、报告在后，段名写成单数或打乱顺序这条先红。
+const sectionOrder = ["Usage:", "Principle:", "Semantics:", "Report:", "Scope:"].map((label) => toolDoc.indexOf(label));
+check("the tool description keeps the five sections in order", sectionOrder.every((index) => index >= 0) && sectionOrder.every((index, position) => position === 0 || index > sectionOrder[position - 1]), JSON.stringify(sectionOrder));
 // Scope 段不许再重复默认条数与上限——那在 Semantics 里一次就够（0.4.12 刚删掉这处重复）。
 const scopeSection = toolDoc.slice(toolDoc.indexOf("Scope:"));
 check("the Scope section does not repeat the default cap", scopeSection.length > 0 && !/cap(?:ped)? at/i.test(scopeSection) && !/defaults to/i.test(scopeSection) && /exclude:""/.test(scopeSection), scopeSection);
@@ -233,8 +244,10 @@ try {
 const defaultToolDoc = defaultTool?.description ?? "";
 const defaultParams = defaultTool?.parameters?.properties ?? {};
 const defaultScopeSection = defaultToolDoc.slice(defaultToolDoc.indexOf("Scope:"));
-check("the tool description states the maxResults default and cap from the constants", defaultCompileError === void 0 && defaultToolDoc.includes(`maxResults defaults to ${DEFAULT_MAX_RESULTS}, capped at ${MAX_RESULTS_CAP}`), defaultCompileError === void 0 ? `default ${DEFAULT_MAX_RESULTS}, cap ${MAX_RESULTS_CAP}` : `${defaultCompileError.code ?? defaultCompileError.name}: ${defaultCompileError.message}`);
-check("the maxResults parameter description states that same cap and default", (defaultParams.maxResults?.description ?? "").includes(`1–${MAX_RESULTS_CAP}`) && (defaultParams.maxResults?.description ?? "").includes(`default ${DEFAULT_MAX_RESULTS}`), defaultParams.maxResults?.description);
+// 0.5.2：默认值与上限只写在 maxResults 参数 description（主 description 不再复述，钳位提示归运行时 header）。
+check("the maxResults parameter description carries the default and cap from the constants", defaultCompileError === void 0 && (defaultParams.maxResults?.description ?? "").includes(`1-${MAX_RESULTS_CAP}`) && (defaultParams.maxResults?.description ?? "").includes(`default ${DEFAULT_MAX_RESULTS}`), defaultCompileError === void 0 ? `default ${DEFAULT_MAX_RESULTS}, cap ${MAX_RESULTS_CAP}` : `${defaultCompileError.code ?? defaultCompileError.name}: ${defaultCompileError.message}`);
+// 反向守一条：上限不许再出现在主 description 里（一处就够，两处必漂）。
+check("the tool description no longer restates the maxResults cap", !/cap(?:ped)? at/i.test(defaultToolDoc) && (defaultParams.maxResults?.description ?? "").includes(`${MAX_RESULTS_CAP}`), `tool description restates cap ${/cap(?:ped)? at/i.test(defaultToolDoc)}; param carries ${MAX_RESULTS_CAP} ${(defaultParams.maxResults?.description ?? "").includes(`${MAX_RESULTS_CAP}`)}`);
 check("the exclude parameter description states the same default exclusions", (defaultParams.exclude?.description ?? "").includes(`Defaults to ${DEFAULT_EXCLUDE_PATHS.join("; ")}`), defaultParams.exclude?.description);
 check("the tool description's Scope section names those same exclusions", defaultScopeSection.includes(`default exclusions ${DEFAULT_EXCLUDE_PATHS.join("; ")}`), defaultScopeSection);
 // 上面四条全是「描述 vs 常量」的互校，期望串由常量自己拼：常量漂了它们照样全绿（实测把
@@ -489,8 +502,12 @@ check("a search alone stays bare", buildSearch({ search: "*.dll" }) === "*.dll")
 // 契约（P0-3）：path: 的 scope 一律先规范化分隔符、补尾分隔符再加引号，Everything
 // 才会匹配目录内容而不是目录名本身，所以这里的期望值带尾反斜杠。这条断言随契约
 // 改过，不是为了让测试变绿。
-check("a scope with spaces is quoted", buildSearch({ search: "ext:dll", path: spacedScope }) === `ext:dll path:"${spacedScope}\\"`, buildSearch({ search: "ext:dll", path: spacedScope }));
-check("default exclusions render as !path:", buildSearch({ search: "*.md" }, parseExclude(void 0)) === "*.md !path:$RECYCLE.BIN !path:\"System Volume Information\" !path:WinSxS", buildSearch({ search: "*.md" }, parseExclude(void 0)));
+// 契约：path: scope 前置（prepend），不是后置。buildSearch 用 terms.unshift 让 scope 先于正文词，
+// 因为 content*: 会把它之后的全部内容当字面量；后置会让 scope 失效。期望值随契约改，不是为了让测试变绿。
+check("a scope with spaces is quoted", buildSearch({ search: "ext:dll", path: spacedScope }) === `path:"${spacedScope}\\" ext:dll`, buildSearch({ search: "ext:dll", path: spacedScope }));
+// 与上一条同一条契约：排除规则也是 unshift 前置（content*: 之后写 !path: 会被当字面量，脏目录会悄悄回来）。
+// 逐条 unshift 的结果是顺序反转，所以期望值从 WinSxS 起。
+check("default exclusions render as !path:", buildSearch({ search: "*.md" }, parseExclude(void 0)) === "!path:WinSxS !path:\"System Volume Information\" !path:$RECYCLE.BIN *.md", buildSearch({ search: "*.md" }, parseExclude(void 0)));
 check("exclude:\"\" disables exclusions", buildSearch({ search: "*.md" }, parseExclude("")) === "*.md");
 let missingScopeThrew = false;
 try {
@@ -531,6 +548,15 @@ try {
 check("allDrives without pathMustExist:false is rejected instead of doing nothing", allDrivesAloneError instanceof Error && /allDrives only authorises the whole-index fallback/.test(allDrivesAloneError.message), allDrivesAloneError === void 0 ? "no error thrown" : allDrivesAloneError.message);
 const ignoredScopeHeader = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, pathIgnored: "C:\\definitely missing dir 42" }).split("\n")[0];
 check("the header says a dropped path was ignored", /path ignored: does not exist/.test(ignoredScopeHeader), ignoredScopeHeader);
+// P0-3：scope 不存在是带码的参数错误，不再只是一句自由文案。默认路径报 E_SCOPE_DROPPED；
+// 显式 allDrives:true 才走「授权后丢 scope」那条，结果头写明结果不来自该目录。
+let droppedScopeCode;
+try {
+	buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42" });
+} catch (error) {
+	droppedScopeCode = error;
+}
+check("a missing scope carries the E_SCOPE_DROPPED code", droppedScopeCode?.code === "E_SCOPE_DROPPED", droppedScopeCode === void 0 ? "no error thrown" : `${droppedScopeCode.code}: ${droppedScopeCode.message}`);
 // 0.4.7-2：type 渲染成 Everything 自己的 file:/folder:（零新 SDK 绑定，实测
 // node_modules folder: 393 / file: 2 对着全量 33307）。串里已带 file:/folder: 时不重复
 // 追加——两个词 AND 成 0 条，静默归零最贵，所以「没追加」做成值字段并上结果头。
@@ -541,11 +567,56 @@ const typeNotes = {};
 const conflictingTypeSearch = buildSearch({ search: "node_modules folder:", type: "file" }, [], typeNotes);
 const conflictingTypeHeader = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, typeIgnored: typeNotes.skippedType }).split("\n")[0];
 check("type is not re-appended when the search already filters", conflictingTypeSearch === "node_modules folder:" && typeNotes.skippedType === "file" && /type not appended/.test(conflictingTypeHeader), `${conflictingTypeSearch} / ${typeNotes.skippedType} / ${conflictingTypeHeader}`);
+// v2 P0-2 + P1：类型断言只能有一个来源（参数 type、串内 file:/folder: 宏、隐含文件的 ext:）。
+// 四条判死全部要报带 code 的参数错误并附可执行改写，而不是静默回 0 条——实测
+// `folder:doc ext:txt`、`type: dir` + `ext:txt`、`*.dll folder: file:` 都是 0 条。
+const typeConflictCases = [
+	["type parameter plus a folder: macro", { search: "doc folder:", type: "dir" }, "E_TYPE_AMBIGUOUS"],
+	["type parameter plus a file: macro", { search: "notes.txt file:", type: "file" }, "E_TYPE_AMBIGUOUS"],
+	["two type macros at once", { search: "doc folder: file:" }, "E_TYPE_AMBIGUOUS"],
+	["folder: plus ext:", { search: "folder:doc ext:txt" }, "E_TYPE_CONFLICT"],
+	["type: dir plus ext:", { search: "ext:txt", type: "dir" }, "E_TYPE_CONFLICT"],
+	["type: dir plus an extension wildcard", { search: "*.txt", type: "dir" }, "E_TYPE_CONFLICT"],
+	// `type:` 不是 Everything 函数，写进 search 只会被当成字面文件名（实测
+	// `node_modules type:dir` 回 0 条）。纯误用、与参数撞车、取值非法是三种不同的错，
+	// 各给一个码，调用方才能按码分支。
+	["type: written inside search", { search: "node_modules type:dir" }, "E_TYPE_INLINE"],
+	["type: inside search plus the type parameter", { search: "node_modules type:dir", type: "dir" }, "E_TYPE_AMBIGUOUS"],
+	["type: inside search with an invalid value", { search: "node_modules type:bogus" }, "E_TYPE_BAD_VALUE"],
+	// `sort:` 是 Everything 原生函数：它不参与过滤，而是改排序，且 SetSort 是进程级全局
+	// 状态，所以串内那一项会静默盖掉 sort/descending 参数（实测：条数与路径全对，只有
+	// 顺序错）。归零看得见，错序看不见，所以单独一个码。
+	["sort: written inside search", { search: "node_modules sort:size" }, "E_SORT_INLINE"],
+	["sort: inside search plus the sort parameter", { search: "node_modules sort:size", sort: "size" }, "E_SORT_AMBIGUOUS"],
+	["sort: inside search plus descending", { search: "node_modules sort:size", descending: true }, "E_SORT_AMBIGUOUS"],
+	// 其余参数名写进 search：不是 Everything 函数，只会被当字面查询词 AND 成 0 条。
+	["descending: written inside search", { search: "node_modules descending:true" }, "E_PARAM_INLINE"],
+	["offset: written inside search", { search: "node_modules offset:10" }, "E_PARAM_INLINE"],
+	["countOnly: written inside search", { search: "node_modules countOnly:true" }, "E_PARAM_INLINE"]
+];
+const typeConflictFailures = [];
+for (const [label, conflictArgs, expectedCode] of typeConflictCases) {
+	let caught;
+	try {
+		await compiledTool.execute(conflictArgs, { signal: new AbortController().signal });
+	} catch (error) {
+		caught = error;
+	}
+	if (caught === void 0) typeConflictFailures.push(`${label}: no error thrown`);
+	else if (caught.code !== expectedCode) typeConflictFailures.push(`${label}: code ${caught.code} instead of ${expectedCode}`);
+	else if (caught.hints === void 0 || typeof caught.hints.rewrite !== "object") typeConflictFailures.push(`${label}: no hints.rewrite`);
+	// 改写本身不许再撞一次：带 type 的 rewrite 里不能再有类型宏，否则调用方照着改还是错。
+	else if (typeof caught.hints.rewrite.type === "string" && /\b(?:file|folder):/i.test(String(caught.hints.rewrite.search ?? ""))) typeConflictFailures.push(`${label}: rewrite still carries a type macro (${caught.hints.rewrite.search})`);
+	// 改写必须真能执行：search 是必填参数，空串既不是合法查询、也表达不了「只要目录」。
+	// 压测实测 `type: dir` + `ext:txt` 曾给出 { type: "dir", search: "" }，旧断言没拦住。
+	else if ([caught.hints.rewrite, caught.hints.alternative].filter((hint) => hint !== void 0).some((hint) => typeof hint.search === "string" && hint.search.trim().length === 0)) typeConflictFailures.push(`${label}: a hint carries an empty search (${JSON.stringify(caught.hints)})`);
+}
+check("every type conflict is a coded argument error carrying an executable rewrite", typeConflictFailures.length === 0, typeConflictFailures.length === 0 ? `${typeConflictCases.length} coded conflicts` : typeConflictFailures.join(" | "));
 // 一档第 1 条：带通配的 scope 不许被存在性检查误杀（`D:` 盘在不在都不是参数错误）。
 // 同时尾部通配要被折叠：实测 `path:C:\x\*` 回 0 条、`path:C:\x` 回 19 条——Everything
 // 的 `path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。
 const wildcardScope = buildSearch({ search: "*.dll", path: "D:/code/*" });
-check("a wildcard scope is not stat-ed away and its trailing wildcard is collapsed", wildcardScope === "*.dll path:D:\\code\\", wildcardScope);
+check("a wildcard scope is not stat-ed away and its trailing wildcard is collapsed", wildcardScope === "path:D:\\code\\ *.dll", wildcardScope);
 let wildcardWithSpaces = "";
 try {
 	wildcardWithSpaces = buildSearch({ search: "*.dll", path: "C:/Program Files/*" });
@@ -554,7 +625,7 @@ try {
 }
 // 带空格的通配 scope：既要不报错、要加引号，尾部通配也要被折叠（`C:\x\*` 与 `C:\x\` 同义，
 // 前者实测回 0 条）。期望值随新契约改，不是为了让测试变绿。
-check("a wildcard scope with spaces stays quoted and loses its trailing wildcard", wildcardWithSpaces === "*.dll path:\"C:\\Program Files\\\"", wildcardWithSpaces);
+check("a wildcard scope with spaces stays quoted and loses its trailing wildcard", wildcardWithSpaces === "path:\"C:\\Program Files\\\" *.dll", wildcardWithSpaces);
 // scope 指向文件：实测 `*.md` + path=真实 .md 文件恒为 0 命中，且旧输出一句提示都没有
 // （给文件补了尾分隔符）。path 只收目录，所以这里必须是显式参数错误、并给出两条出路。
 // 样本用 process.execPath：绝对路径、必然存在、必然是文件，不硬编码仓库位置。
@@ -620,7 +691,9 @@ check("countOnly prints a count, not an offset page", countOnlyText.split("\n")[
 // 0 命中有两组注记——头行的边界尾注、页脚的「放宽」出路——它们共用同一组门控，所以
 // 守门也必须共用一把尺子。旧写法把守卫写成 `!/not in index/`：措辞一改，正则再也匹配
 // 不到任何东西，「该不出现时必须不出现」就静默失效（测试照样绿，但已经不管事）。
-const hasZeroAnnotation = (text) => /no match in the index/.test(text) || /widen:/.test(text);
+// P2-1：范围版首行改写成 `no match inside path:`，守卫必须同步认得它——只认索引版会让
+// 「不该出现时必须不出现」对 scope 版静默失效（测试照样绿，但已经不管事）。
+const hasZeroAnnotation = (text) => /no match in the index/.test(text) || /no match inside path:/.test(text) || /widen:/.test(text);
 const zeroLoadedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true });
 check("a zero-hit first line names the index boundary without the word missing", zeroLoadedText.split("\n")[0] === "Found 0 results = no match in the index (indexed volumes only)" && !/missing/i.test(zeroLoadedText), zeroLoadedText.split("\n")[0]);
 const zeroCountOnlyText = formatOutput({ items: [], total: 0, truncated: false, countOnly: true, dbLoaded: true });
@@ -630,6 +703,11 @@ check("an unloaded index points at everything_status instead of concluding", /�
 const zeroScopedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, pathIgnored: "C:\\missing-42" });
 const zeroTypedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, typeIgnored: "file" });
 check("a rewritten scope keeps both zero-hit annotations off", !hasZeroAnnotation(zeroScopedText) && !hasZeroAnnotation(zeroTypedText), `${zeroScopedText.split("\n")[0]} | ${zeroTypedText.split("\n")[0]}`);
+// P2-1：范围生效时首行换成范围版，索引版必须消失——两句同屏会互相否定，读的人只能随机信一句。
+const zeroInScopeText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, scopeApplied: "C:\\work" });
+check("a scoped zero-hit replaces the index verdict instead of stacking a second one", zeroInScopeText.split("\n")[0] === "Found 0 results = no match inside path: C:\\work (this folder only; nothing matches there, or that folder is not indexed - other folders were not searched)" && !/no match in the index/.test(zeroInScopeText), zeroInScopeText.split("\n")[0]);
+const zeroUnscopedText = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true });
+check("an unscoped zero-hit keeps the index verdict verbatim", zeroUnscopedText.split("\n")[0] === "Found 0 results = no match in the index (indexed volumes only)" && !/no match inside path:/.test(zeroUnscopedText), zeroUnscopedText.split("\n")[0]);
 // 0 命中必须有下一步：与截断页脚的 narrow 对称，给一条「放宽」的出路。排除规则是零命中的
 // 一个常见成因，而且条数已经写在头行，所以当次生效时把 exclude:"" 一并给出。
 const zeroWithExclusions = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, excluded: 3 });
@@ -1121,7 +1199,9 @@ faceModule.everything.apply(routedFake.ctx, { maxResults: 7, timeoutMs: 9000 });
 const routedTool = routedFake.tools.get("everything_search");
 // description 里那句原文是 `maxResults defaults to ${caps.maxResults}`，所以判据钉 `defaults to 7`：
 // 组件行的 maxResults 没被读到的话这里就是 `defaults to 100`。
-check("a component-row config reaches the tool description", /defaults to 7\b/.test(routedTool?.description ?? "") && routedTool?.timeoutMs === 9000, `${/defaults to 7\b/.test(routedTool?.description ?? "") ? "defaults to 7" : "default not routed"}, timeoutMs ${routedTool?.timeoutMs}`);
+// 0.5.2：组件行配的 maxResults 现在经参数 description 落地（主 description 只留骨架），所以探针换成读参数文本。
+const routedMaxDoc = routedTool?.parameters?.properties?.maxResults?.description ?? "";
+check("a component-row config reaches the maxResults parameter description", /default 7\b/.test(routedMaxDoc) && routedTool?.timeoutMs === 9000, `${/default 7\b/.test(routedMaxDoc) ? "default 7" : "default not routed"}, timeoutMs ${routedTool?.timeoutMs}`);
 
 // path 与串内 path: 撞车：两条 path: 会 AND 成 0 条，旧行为是静默丢掉 path 参数，调用方把
 // 「参数被吞掉」读成「该目录里没有」。现在必须报参数错误，并给两条出路。
@@ -1151,10 +1231,10 @@ const directScope = scopeOf(scopeDir);
 // 尾部通配分两种形态，不能合并成一条：`dir\*`／`dir\**` 是「该目录下全部」，等价于直连目录
 // （补尾分隔符）；`name*` 是名字前缀，补了分隔符就变成「这个精确目录」，把 `dsh-voice-s*`
 // 逼回 0 条（实测直连 `dsh-voice-suite-main` 有 1 个 .md）。两条各钉各的形态。
-check("a directory slash wildcard folds to the direct scope", directScope === `*.md path:${scopeDir}\\` && scopeOf(`${scopeDir}\\*`) === directScope && scopeOf(`${scopeDir}\\**`) === directScope, `${scopeOf(`${scopeDir}\\*`)} | ${scopeOf(`${scopeDir}\\**`)} | direct ${directScope}`);
-check("a name-prefix wildcard keeps the prefix and takes no trailing separator", scopeOf(`${scopeDir}*`) === `*.md path:${scopeDir}`, scopeOf(`${scopeDir}*`));
+check("a directory slash wildcard folds to the direct scope", directScope === `path:${scopeDir}\\ *.md` && scopeOf(`${scopeDir}\\*`) === directScope && scopeOf(`${scopeDir}\\**`) === directScope, `${scopeOf(`${scopeDir}\\*`)} | ${scopeOf(`${scopeDir}\\**`)} | direct ${directScope}`);
+check("a name-prefix wildcard keeps the prefix and takes no trailing separator", scopeOf(`${scopeDir}*`) === `path:${scopeDir} *.md`, scopeOf(`${scopeDir}*`));
 // 中间通配（`C:\a*\b`）没有可证明的等价物，必须原样保留——否则一次前缀匹配会被改成精确目录。
-check("a wildcard in the middle of a scope is left alone", scopeOf("C:/a*/b") === "*.md path:C:\\a*\\b", scopeOf("C:/a*/b"));
+check("a wildcard in the middle of a scope is left alone", scopeOf("C:/a*/b") === "path:C:\\a*\\b *.md", scopeOf("C:/a*/b"));
 let wildcardMissingParent;
 try {
 	buildSearch({ search: "*.md", path: path.join(repoRoot, "no-such-dir-42", "anything*") });

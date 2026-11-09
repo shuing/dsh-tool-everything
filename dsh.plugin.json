@@ -2,7 +2,7 @@
   "name": "dsh-tool-everything",
   "displayName": "Everything Search",
   "description": "通过 Everything 索引全盘秒搜 Windows 文件系统",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "platform": "windows",
   "tags": ["search", "windows", "everything", "filesystem"],
   "homepage": "https://github.com/shuing/dsh-tool-everything",
