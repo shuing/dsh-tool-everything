@@ -33,7 +33,7 @@ dsh plugin --profile web add "github:shuing/dsh-tool-everything"
 
 装完**硬刷新浏览器**（`Ctrl+Shift+R`），**新开会话**即可使用。
 
-> ⚠️ 请确认安装的是 **0.5.3 及以上**版本。0.2.0 的 `peerDependencies`
+> ⚠️ 请确认安装的是 **0.5.5 及以上**版本。0.2.0 的 `peerDependencies`
 > 只声明了 `^0.1.0-rc.6`，会被 DSH 0.2.x 的兼容性检查判为不兼容并拒绝安装
 > （报错 `incompatible-version`）。现行声明为 `engines.dsh: ">=0.2.0-rc.1 <1.0.0"`，
 > 各条 DSH `peerDependencies` 同区间——版本区间只是安装期兜底提示，真正决定能不能跑的是下文的宿主能力探测。
@@ -66,13 +66,62 @@ dsh plugin --profile web add "github:shuing/dsh-tool-everything"
 1. `anytxt_search` 的 `modified` 列改成**本地时间**。索引回的是 ISO(UTC)，旧实现只把 `T`／`Z` 去掉就印出来，同一个文件会比 `everything_search` 那一列早整整一个时区（本机 8 小时），且两边都没有时区标记——读的人只会得出「这是两个不同版本」。现在两个面共用 `lib/shared/format.mjs` 的同一个本地时间格式化函数。
 2. `anytxt_read` 在 `ref` 的 fid 不存在时不再静默返回 `0 of 0 characters`（那是「读到一个空文档」的语义），改报 `ANYTXT_FID_NOT_FOUND`。实测服务端对不存在的 fid 回 `errno 1` + `text: null`，对有效 fid 回 `errno 0` + 字符串，所以两者可区分；`GetFragmentAll` 两种都回 `errno 0`，`fragments` 侧分不出，只有 `full` 能报。此前 `errno` 只在 `anytxt_sync_index` 那条路径上被读过。
 
+### 0.5.5 压缩仍只对 path 开启（name 试过又撤回）
+
+前缀压缩曾短暂扩到 `sort:name`，实测后**撤回**，仍只对 `sort:path` 开启。
+
+### 2026-11-10 静态文案精简 49% + 三处实测缺陷修正
+
+**精简**：三类静态文本（prompt 段 / 工具 description / 11 个参数 description）从 **5993 → 3057 字符（−49%）**，未删任何一条实测知识。删的是：算子逐个举的重复例子、`sort` 压缩收益的论证过程（那属于设计文档，调用方只需要「默认 path、分页别改」）、与运行时输出重复的约束复述。用的写法是符号化速记——`FREE:` 代 `are free and read`、`→` 代 `then relax it to`、`≈` 代 `about`、`(~7000 = 7s budget)` 括号装因果。保留的三条「坑」一字未动：`content:` 成本公式（**它是事前预警，移到超时文案就变成烧完才说**）、`parent:` 需完整路径、压缩包需 scope。
+
+**修正 1（文档错误）**：`sort` 的默认值。README 原写「不传按 `name` 升序」，而源码是 `sdk.DEFAULT_SORT = "path"`。判别实验：两个子目录交换文件名（`aa_dir\zzz.txt`、`zz_dir\aaa.txt`），不传 `sort` 时按目录分组、`aa_dir` 组在前（path 序）；传 `sort:name` 时 `aaa.txt` 在前（name 序）。顺序相反，旧说法一眼可证伪。
+
+**修正 2（文案与能力矛盾）**：超时文案原写「an archive entry name ... are not [indexed]」，把「未加 scope 时太慢」错写成「能力不存在」，且把 `tar;gz` 列进可继续往里搜的容器。实测同一 token 加 `path:` 即命中；tar 系两种检索全 0。已按实测重写，并新增下面的能力矩阵。
+
+**修正 3（改写串引号嵌套）**：`E_CONTENT_TYPE_CONFLICT` 的改写建议原为 `{ search: "docs content:"X"" }`——引号嵌套，照抄即非法查询。`hints.rewrite` 对象本身正确，坏的只是文案里的展示拼接；现有断言只校验 `hints`，所以测试全绿也没发现，只有真照抄去执行才暴露。已改为 `{ search: "docs content:\"X\"" }`。
+
+**新增**：`archiveHint` 条件式页脚提示、`.gitignore` 禁止 `lib/` 下再散落 `*.bak*`、`archive/` 归置 12 份历史快照。
+
+**移除**：`E_CONTAINER_CONTENT_NEEDS_SCOPE` 前置校验（连同 `content:` 的「必须配收窄项」throw）。两者都属于参数层的过度干预：watchdog 已经在 7 秒预算到点 `SIGKILL` worker 并回 `EVERYTHING_QUERY_TIMEOUT`，那就是够用的兜底。实测放开后，无 scope 的 `content:` 与 `container-filenames:` 分别于 7036ms / 7020ms 被兜底中止，系统随后立即恢复（文件枚举 12ms），无残留进程。**保留的唯一形态约束**是 `content*:`——星号会把其后整段变成字面文本，收窄项写在星号后面会被吞掉，这是语法事实而非成本判断，仍会报错。
+
+| 排序 | 同目录连续段 | 压缩后字符 | 省 | 是否启用 |
+| --- | --- | --- | --- | --- |
+| path | 90 | 35,399 | 49.0% | ✅ |
+| name | 151 | 40,435 | 41.8% | ❌ 撤回 |
+| size | 166 | 41,517 | 40.2% | ❌ |
+| dateModified / dateCreated | — | — | — | ❌ |
+
+- **`name` 为什么撤回**：它确实省 41.8% 字符，但文件名首字母交替会让目录行来回切。实测 8 条结果产生 6 个目录行（含单独成行的 `..\`），行数从 8 涨到 14——字符省了，阅读反而更费劲。（当时缺省 `sort` 还是 name；现在已改为 path，见下方 `DEFAULT_SORT`。）
+- `size` / `dateModified` / `dateCreated` 不启用：排行榜用途，行序本身就是答案；目录被打散到 166 段，压缩会让近乎每条文件各配一行目录。
+- **补上一处测试缺口**：此前没有任何断言校验「哪些排序该启用压缩」，条件写宽或写窄时全部用例照绿。现在 `test/verify.mjs` 直接从源码读出启用条件，对每种排序复算期望值，另加一条「条件里不许有 name 兜底」——把 `name` 重新加回去会同时触发两条失败。
+- 三种排序的可逆性均验证 500/500。改后 `219 passed / 0 skipped / 0 failed`。
+
+### 0.5.4 跳转上限收到 1 层
+
+对 500 条真实路径做了 `MAX_HOP_LEVELS` 取值扫描（逐档改常量跑生产实现）：
+
+| cap | 字符数 | 相对全路径 | 跳转行 | 其中多级 |
+| --- | --- | --- | --- | --- |
+| 0（禁用跳转） | 36,381 | 47.7% | 0 | 0 |
+| **1（当前）** | **35,399** | **49.0%** | **24** | **0** |
+| 2 | 35,263 | 49.3% | 34 | 10 |
+| 3（旧值） | 34,633 | 50.2% | 58 | 24 |
+| 10 | 34,432 | 50.5% | 81 | 47 |
+
+从 1 放到 10 只多省 1,013 字符（1.5%），却多出 57 行需要心算的多级 `..`。单层 `..\` 一眼可读，`..\..\` 就要停下来数——所以把上限从 3 收到 1：**多花 1.2% 的体积，换掉全部多级跳转**。
+
+- 形态：文本里只会出现单层 `..\`；更深的上跳一律改打完整绝对路径。
+- 可逆性不变：500 条真实路径仍是 500/500（逐段上跳的独立解析器验证）。
+- 测试：原「两层跳转仍用 `..`」的断言改为「超限退回绝对路径」，另加一条「单层跳转仍生效」防止上限收过头把功能关掉。改后 `217 passed / 0 skipped / 0 failed`。
+- 旧值 3 的依据是一份 13 行样本，样本太短，每一跳看起来都便宜；500 行扫描才是可信口径。
+
 ### 0.5.3 `sort:path` 前缀压缩
 
 同一条查询，`sort:path` 的文本比按 `name` 排序省约一半字符（500 条真实数据 69467 → 34587，约 −50%），**`items` 与分页完全不变**：
 
 1. **形态**：目录单独成行，文件缩进四格；跳转写成 `..\` 前缀，层数 = 上一目录深度 − 共享段数（所以跨两层是 `..\..\x`，不是一个 `..\x`）。只缩短目录，文件名与「大小／时间」两列与 `formatItem` 逐字节相同。
-2. **只在 `sort:path` 开启**。按 `name`/`size` 排序时目录被打散（实测 500 条：name 151 段、size 164 段、path 仅 90 段），压缩只会把 `..\` 乱跳堆给读的人。开关是 `value.compacted`，`formatOutput` 只读这个布尔值。
-3. **三种情况回退绝对路径**：每页第一行（页首必须自足）、换盘符（`..` 到不了另一块盘）、上跳超过 3 层（`MAX_HOP_LEVELS`，点号比省下的前缀还长）。最后一条是量出来的：一份 13 行样本里最深一跳写了 10 个 `..\`，跳转行占压缩版 31%、总节省跌到 21%；加上限后降到 6.9%，总节省反升到 22.3%。
+2. **只对 `sort:path` 开启**。path 的顺序等于目录序，压缩几乎零损失（实测 500 条：90 个目录段，省 49.0%），读起来是整块整块的。`name` 曾被打开又撤回：它确实省 41.8%，但文件名首字母交替会让目录行来回切——8 条结果产生 6 个目录行（含单独成行的 `..\`），行数从 8 涨到 14，而缺省 `sort` 走的正是 name。`size` / `dateModified` / `dateCreated` 是排行榜用途，行序本身就是答案，同样不开。开关是 `value.compacted`，`formatOutput` 只读这个布尔值；启用范围由 `test/verify.mjs` 从源码读条件复算，写宽或写窄都会红。
+3. **三种情况回退绝对路径**：每页第一行（页首必须自足）、换盘符（`..` 到不了另一块盘）、上跳超过 1 层（`MAX_HOP_LEVELS=1`）。最后一条是扫描出来的：对 500 条真实路径逐档改上限实测，cap 从 1 放到 10 只多省 1,013 字符（1.5%），却多出 57 行需要心算的多级 `..`；单层 `..\` 一眼可读，`..\..\` 就要数了。所以取 1——多花 1.2% 体积，换掉全部多级跳转。
 4. **修掉三个真实页面抓到的 bug**：多级跳转曾只写一个 `..`（指向不存在的兄弟目录）；目录变浅时曾只打缩进行（文件被读成仍在更深的目录里）；盘符根曾印成 `C:`（少尾分隔符，解析后成 `\C:\...`）。
 5. **验收标准是还原能力，不是体积**。`test/verify.mjs` 用一条独立实现的解析器把压缩输出还原成原始路径序列再逐条比对，500 条真实路径还原 500/500；另加 5 条形状断言钉住上面每条回退规则。改后实测 `216 passed / 0 skipped / 0 failed`（anytxt 侧 `83 passed / 0 failed`）。
 6. 与既有参数零冲突：`countOnly` / `offset` 分页 / `descending` / `maxResults` 钳位 / `exclude` / `path` / `type:dir` / 空结果 / 跨盘 / 特殊字符路径（`$`、空格、中文、超长、尾随空格）逐项实测通过。压缩逻辑不参与排序决策、参数校验或分页计算。
@@ -117,6 +166,8 @@ dsh-tool-everything/
 ├── native/
 │   ├── Everything64.dll               随包的 Everything SDK（x64，voidtools 签名）
 │   └── LICENSE                        SDK 自己的许可
+├── archive/                            非运行文件：12 份历史 index.js/format.mjs 快照
+│   └── NOTE.md                        归置规范与清单（不进 pack 白名单）
 ├── test/
 │   ├── verify.mjs                     文件名面 + 打包 + 文档互校
 │   └── anytxt.verify.mjs              内容面，全离线（注入 fetchImpl）
@@ -145,6 +196,24 @@ dsh-tool-everything/
 
 ### `everything_search`
 
+#### 压缩包检索能力矩阵（实测，非文档抄录）
+
+写这张表的原因：原先超时文案里写着「an archive entry name ... are not [indexed]」，把「**未加 scope 时太慢**」错写成了「**这个能力不存在**」。调用方据此放弃 `zipfilename:`／`container-filenames:`，转去逐个打开容器——而实测同一个 token 加上 `path:` 后一条查询即命中。同一段文案还把 `tar;gz` 列进「可继续往里搜的容器」，而 tar 系的条目名与正文**都读不到**，照样把调用方送进空结果。
+
+| 容器格式 | 包内**条目名** | 包内**正文** | 验证方式 |
+| --- | --- | --- | --- |
+| `.zip` | ✅ 可搜 | ✅ 可搜（真解压，实测压缩比 1% 的大包仍命中） | `container-filenames:` / `content:` + `path:` |
+| `.7z` | ✅ 可搜 | ❌ 不可搜 | 条目名命中、同一内容的 `content:` 只命中原始文件 |
+| `.rar` | ✅ 可搜（条目名） | ❌ 不可搜 | 条目名形态与 7z 同源；本机无 rar 解包工具，**正文一侧未实测**，按 7z 同口径保守声明 |
+| `.tar` / `.tar.gz` | ❌ 不可搜 | ❌ 不可搜 | `tar -tf` / `tar -xOf` 确认包内确有该文件与内容，而两种查询均 0 命中；`ext:tar;gz` 只能**定位容器**、不能检索内容 |
+
+**两条使用要点**：
+
+1. **建议带 scope，但不强制。** `container-filenames:`／`zipfilename:`／作用于压缩包的 `content:` 都要**逐个打开候选容器或候选文件**才能回答；无 scope 时候选集是整个索引，实测稳定跑满 7000ms 预算后被 watchdog 杀掉。想让它按时返回，就传 `path` 参数（已知目录时最优），或串内带 `path:`／`ext:`／`size:`／日期类术语。
+
+   **参数层不再前置拒绝**（2026-11-10 变更）：此前无 scope 会被 `E_CONTAINER_CONTENT_NEEDS_SCOPE` 秒级拦下，但那条守卫越界了——插件定位是兜底与规范，不是替调用方否决查询。watchdog 本身就在 `timeoutMs - 1000ms`（默认 7000ms）到点 `SIGKILL` worker 并回 `EVERYTHING_QUERY_TIMEOUT`，这就是现成的兜底闸门：查询必然中止、机器不会被长期拖住、调用方拿到可行动的码。前置 throw 只是把同一个结局提早一句话，却剥夺了「这 7 秒值不值得等」的判断权。实测：无 scope 的 `content:` 与 `container-filenames:` 都在 **7036ms / 7020ms** 被兜底中止，之后系统文件枚举仍为 12ms，无残留。
+2. **`.zip` 的 `content:` 命中来源不可辨。** Everything 对 zip 同时匹配「条目名」与「解压后正文」，但 SDK 只回传**宿主压缩包的路径**，不告诉你是哪一部分命中的。实测：token 只存在于条目名、正文一个字都没有的 zip，`content:` 同样命中，且输出与「正文真的含该词」完全一致。所以把 `content:` 命中 `.zip` 当成「包内正文有这个词」之前，需要人工复核——用 `zipfilename:` 确认是否是条目名，或打开容器确认正文。
+
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `search` | string | 必填，Everything 搜索表达式；定义只枚举六个常用算子（`path:`／`ext:`／`size:`／`dateModified:`／`folder:`／`content:`），实现上 **Everything 原生语法原样透传**（`size:>10mb`、`dateModified:thisweek`、`ext:zip`、`content:词`、`folder:`，实测可用：`size:>100mb` @ `C:\Windows` 回 60 条）；`regex:` 双引号形态承载空格且**大小写不敏感**（实测 `regex:"DEEPSEEK-AI"` 命中 `@deepseek-ai`）；`ext:` **只有前缀没有值**时直接报参数错误（`ext: requires a value`，旧版回 5／1／0 那种既不是「无过滤」也不是错误的数） |
@@ -154,8 +223,8 @@ dsh-tool-everything/
 | `maxResults` | number | 单次返回条数，1–500，默认见常量 `DEFAULT_MAX_RESULTS`，文档不写死数字 |
 | `offset` | number | 分页起点：接上一条结果里的 `nextOffset` 继续翻页，首页不传（定义原文就这一句）。负数即参数错误、`countOnly` 不许配正 `offset`，都是 `execute` 的判定，由**运行时输出**给出，不进定义 |
 | `exclude` | string | `;` 分隔的排除片段，渲染成 `!path:<片段>`；默认 `$RECYCLE.BIN; System Volume Information; WinSxS`，传空串关闭 |
-| `sort` | string | 可选，排序字段：`name`/`path`/`size`/`dateModified`/`dateCreated`，其它值报参数错误。白名单在 `execute` 里校验，不走 schema enum（本宿主 DSL 挑食）；**不传按 `name` 升序**——实现里显式写回 SDK 排序值 1（`SetSort` 是进程级状态，不写回就会让上一条查询的排序漏给这一条），所以头部与 `offset` 分页恒按 name 升序解释。**`path` 是读大结果最省的一条**：它是唯一能让同目录文件相邻的排序，因此文本按「目录打一次 + 文件缩进」输出，同一条查询实测省约 50% 字符（500 条 69467 → 34587），且每页首行仍是完整绝对路径、`nextOffset` 分页不受影响。要判断「那里有什么」选 `path`，要判断「谁最大/最新」才选 `size` / `dateModified` |
-| `descending` | boolean | 可选，把 `sort` 反序。定义只给两个搭配示例：配 `sort:dateModified` 取最新、配 `sort:size` 取最大；`sort` 缺省时按 `name` 降序属**实现口径**，不在定义里复述 |
+| `sort` | string | 可选，排序字段：`name`/`path`/`size`/`dateModified`/`dateCreated`，其它值报参数错误。白名单在 `execute` 里校验，不走 schema enum（本宿主 DSL 挑食）；**不传等于 `path` 升序**（`sdk.DEFAULT_SORT = "path"`，不是 name——判别实验见下）。`SetSort` 是进程级状态，每次查询都显式写回，否则上一条的排序会漏给这一条。**`path` 是读大结果最省的一条**：它是唯一能让同目录文件相邻的排序，因此文本按「目录打一次 + 文件缩进」输出，同一条查询实测省约 50% 字符（500 条 69467 → 34587），且每页首行仍是完整绝对路径、`nextOffset` 分页不受影响。要判断「那里有什么」选 `path`，要判断「谁最大/最新」才选 `size` / `dateModified` |
+| `descending` | boolean | 可选，把 `sort` 反序。两个搭配示例：配 `sort:dateModified` 取最新、配 `sort:size` 取最大。`sort` 缺省时按 `path` 降序（默认序的反序），**不是「忽略」**——旧文案写 `Ignored when` 与实现正好相反，已被断言钉死 |
 | `countOnly` | boolean | 可选，只报匹配总数：`items` 为空数组、`total` 是全集计数，解码整段跳过——先量规模再翻页就用它。与正 `offset` 互斥这条约束归**运行时输出**，定义里只有用途 |
 | `type` | string | 可选，`file` 或 `dir`。定义原文只有一句「Keep only files or only folders (file, dir)」；渲染成 `file:`／`folder:`、白名单在 `execute` 里校验、与串内 `file:`／`folder:` 撞车报错，全部由**运行时输出**给出 |
 
@@ -163,9 +232,18 @@ dsh-tool-everything/
 
 输出字段：`items`（每项 `path`/`folder`/`size`/`mtime`，`mtime` 是整数 epoch 毫秒（FILETIME 换算后取整，分数毫秒过不了宿主的无损 JSON 判定），读不到给 `-1`；文本里每条按 `路径<TAB>大小<TAB>本地时间` 打印，读不到大小或时间都打 `-`（三列恒在，不留连着的 TAB），不印 1970）、`total`（命中总数）、`truncated`、可选 `nextOffset`、`offset`（本页起点，钳后的真实值）、`countOnly`、`dbLoaded`（Everything 索引是否已加载）、`excluded`（本次生效的排除规则条数）、`pathIgnored`（仅当 `pathMustExist: false` + `allDrives: true` 丢掉了一个不存在的 scope 时带上原 scope）、`typeIgnored`（仅当搜索串里已带 `file:`／`folder:`、`type` 因此未追加时带上那个 `type` 值）、`compacted`（仅当 `sort:path` 且有命中时为 `true`，表示文本用了前缀压缩形态；`items` 本身不变，仍是完整绝对路径）。
 
-**`sort:path` 时的文本形态**：目录单独成行、文件缩进四格，跳转用 `..\` 前缀；`..` 的层数等于「上一目录深度 − 共享段数」，所以跨越多层时会写成 `..\..\x` 而不是 `..\x`。三种情况回退成完整绝对路径：每页第一行、换盘符、上跳超过 3 层（更深的跳转点号比省下的前缀还长，且没人能数清）。还原方法就是按行累加：遇绝对路径就替换当前目录，遇相对行就在当前目录上逐段应用 `..` 与后续段——`test/verify.mjs` 用一条独立实现的解析器把这个往返钉成了断言，500 条真实路径还原 500/500。目录变浅时（`C:\a\b` 之后出现 `C:\a` 的文件）会另起一行目录，哪怕它只是 `..\`，否则该文件会被误读成仍在更深的目录里。
+**`sort:path` 时的文本形态**：目录单独成行、文件缩进四格，跳转用 `..\` 前缀。上限是 1 层，所以**只会出现单层 `..\`，不会出现 `..\..\x`**：更深的上跳一律改打完整绝对路径。三种情况回退成绝对路径：每页第一行、换盘符、上跳超过 1 层。还原方法就是按行累加：遇绝对路径就替换当前目录，遇 `..\` 就上跳一层再拼后续段——`test/verify.mjs` 用一条独立实现的解析器把这个往返钉成了断言，500 条真实路径还原 500/500。目录变浅时（`C:\a\b` 之后出现 `C:\a` 的文件）会另起一行目录，哪怕它只是 `..\`，否则该文件会被误读成仍在更深的目录里。
 
 header 形态照实写，别去找不存在的句子：截断或 `offset > 0` 时是 `Found N of M results (offset X)`，首页且未截断时是 `Found M results`；`offset` 越过总数时头行追加 `offset N is past the end: total is M`，不再把空页印成全量；`countOnly: true` 时 header 只有 `Found <total> matches (count only)`，`items` 为空数组、`truncated` 恒为 `false`（也就没有 `nextOffset`）。非 countOnly 一律在其下固定再输出一行 `shown N / total M / nextOffset X`（没有下一页时 `nextOffset` 打 `-`），把「这只是采样」写进结构；countOnly 不出这一行。`pathMustExist: false` 丢过 scope 时 header 追加 `path ignored: does not exist (…)`，索引未加载时追加 `index is not loaded yet`。**0 命中**且范围未被改写、索引已加载时，header 追加 `= no match in the index (indexed volumes only)`，并在页脚给出一条放宽的出路 `widen: drop path:, drop ext:, or relax the pattern`（当次有排除规则生效时，再带一句 `exclude:""` 的回头路）——这两句共用一个门控：`countOnly`、索引未加载、`pathIgnored`/`typeIgnored` 非空时一律不出。（`type not appended` 只可能出现在直接调 `buildSearch` 的路径上；工具面遇到 `type` 与串内 `file:`／`folder:` 撞车已改在执行期报参数错误，不再走到头行。）
+
+**条件式页脚提示**（只在结果命中该形态时出现，其余查询零成本）：
+
+| 提示原文 | 触发条件 | 为什么放在运行时 |
+| --- | --- | --- |
+| `(<DIR> is a folder, never read it.)` | 结果里含目录项 | `<DIR>` 这层语义只在看到这一行时才需要 |
+| `(a .zip/.7z/.rar hit: content: may have matched an entry NAME, not the body - verify inside the archive before trusting the text.)` | 结果路径以 `.zip` / `.7z` / `.rar` 结尾 | 「命中来源不可辨」只在真命中压缩包时才相关；写进静态文案则每条查询都读一遍以后才可能用到的话 |
+
+`archiveHint` 的正则是 `/\.(?:zip|7z|rar)$/i`，**不含 `.tar`**——tar 系两种检索都读不到，不会被这个提示命中，也不会给出「可能命中条目名」这种对它根本不成立的暗示。实测：`ext:tar` 只回 `arch.tar` 时提示不出现；结果里同时有 `.7z` 时才出现。
 
 ### `everything_status`（探活，无参数）
 
@@ -236,15 +314,15 @@ header 形态照实写，别去找不存在的句子：截断或 `offset > 0` �
 
 插件在加载时向宿主注入**两段 system prompt**，各由对应组件行注册——关掉哪条行，哪段提示词随之消失（order 取值集中在 `lib/shared/prompt-orders.mjs`，一行一个数、全局唯一，不许用 `+1` 凑顺序）。
 
-**第一段**：`name: tool:everything_search`，`order: 3254`，由文件名面注册（`lib/components/everything/index.js`）：
+**第一段**：`name: tool:everything_search`，`order: 3254`，由文件名面注册（`lib/components/everything/index.js`）。现行原文（精简后 246 字符，预算 560）：
 
 ```
-Before work: one everything_search first — find what the machine already has for this task.
-Mid-task: something missing? search first, then guess, ask, or stub.
-Use: everything_search for whole-disk discovery by name — contents are grep's, in-workspace paths are glob's. Index up? ask everything_status; an empty result still means fall back to grep/glob.
-Argument rules live in the tool and parameter descriptions.
-Report in three steps: header, paths verified with read or glob, paging; unverified paths stay "candidate, unverified".
+找文件：不知道名字/位置 → 先搜再猜再问再打桩。已知机器上可能已有 → 开工前先探一遍，否则不必。
+分工：按名 = 本工具；已知文件精读 = grep；工作区路径匹配 = glob；索引可用性 = everything_status。
+Report in three steps: header, paths verified with read or glob, paging; keep unverified as "candidate, unverified".
 ```
+
+2026-11-10 的改动：**删掉了三步法**（`countOnly` 量规模 → `path:` 锁定 → `content:` 过滤）。它和工具 description 里的 `Narrow before read: ...` 是同一件事的两次陈述，且两处算子清单还不一致（prompt 漏 `dm:`、description 漏 `regex:`）——同一规则写两遍必然漂移。现在语法只留 description 那一份。同时把「开工前先搜一次」由强制改为**例外触发**：一个「帮我找个文件」的任务本来就不需要先做探索性查询，强制指令被反复违反比没有更糟（会训练模型忽略 prompt）。最后一句英文报告纪律受断言锁定，不能改。
 
 **第二段**：`name: tool:anytxt_search`，`order: 3255`，由内容面注册（`lib/components/anytxt/index.js`）：
 
@@ -412,8 +490,11 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
   `Everything_GetResultFullPathNameW` 全部返回空串，只设其一则另一个读回 `-1`。
   每一处读回都与它的 flag 成对，`countOnly` 一个都不设、一条都不解码。
 - **`SetSort` 是进程级查询状态**：一次带排序的查询会漏给下一次（实测 `SetSort(5)`
-  之后不传排序的查询仍是 size 升序）。所以未传 `sort` 时显式设回 `name` 升序
-  （Everything 默认序），「不传新参数时行为与旧版一致」才成立。
+  之后不传排序的查询仍是 size 升序）。所以每次都显式写回排序值；未传 `sort` 时写回的是
+  **`path` 升序**（`DEFAULT_SORT = "path"`），不是 Everything 自带的初始序。
+  **判别实验**（`sorttest` 夹具，两个子目录交换文件名）：不传 `sort` 时输出按目录分组、
+  `aa_dir` 组在前（path 序）；传 `sort:name` 时 `aaa.txt` 在前（name 序）。两者顺序相反，
+  所以「默认是 name」这个旧说法一眼可证伪。
 - **FILETIME → epoch 毫秒**：`Math.round(Number(koffi.decode(buf,"int64")) / 10000) - 11644473600000`（必须取整：一个 tick 是 100 ns，不取整就是分数毫秒，宿主会判 value is not lossless JSON），
   对应常量 `FILETIME_EPOCH_OFFSET_MS`；`GetResultDateModified` 与 `DATE_MODIFIED`
   必须成对，缺则读回全 `0`/`-1`。

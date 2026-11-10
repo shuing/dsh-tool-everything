@@ -646,6 +646,89 @@ for (const [label, companionArgs] of contentCompanionCases) {
 	}
 }
 check("content: keeps the type assertions that are not contradictory", contentCompanionFailures.length === 0, contentCompanionFailures.length === 0 ? `${contentCompanionCases.length} allowed shapes` : contentCompanionFailures.join(" | "));
+
+// `|` 是**并集**，两侧各自独立求值；但 `|` 只切分支，分支内部仍是 AND。这条区分是 2026-11-10
+// 实测出来的：原判据「去掉首个宏后还剩不剩 file:/folder:」把并集当 AND 判死，而原生跑得好好的：
+//   folder:docs = 145, folder:notes = 46, folder:docs | folder:notes = 191（恰好相加）
+// 反过来，只要任一分支内部冲突，整个表达式就是 0：
+//   folder:docs folder:notes | readme = 0
+// 所以守卫必须按 | 分段数宏，而不是看「剩下的串里还有没有宏」。
+// 这组用例同时钉住两件事：合法的并集必须放行（否则守卫变成新的假阴性来源），
+// 分支内冲突必须拦下（否则真陷阱漏过去）。
+const pipeBranchCases = [
+	// 放行：每个 | 分支至多一个类型宏
+	["two folder: in separate branches", { search: "folder:docs | folder:notes" }, true],
+	["file: and folder: in separate branches", { search: "file:readme | folder:docs" }, true],
+	["three branches each with one macro", { search: "folder:docs | folder:notes | file:readme" }, true],
+	// 拦下：同一分支内两个类型宏（AND 恒 0）
+	["two folder: in one branch", { search: "folder:docs folder:notes" }, false],
+	["file: plus folder: in one branch", { search: "file:x folder:docs" }, false],
+	["conflict in the left branch", { search: "folder:docs folder:notes | readme" }, false],
+	["conflict in the right branch", { search: "folder:docs | folder:notes file:x" }, false]
+];
+const pipeBranchFailures = [];
+for (const [label, args, shouldPass] of pipeBranchCases) {
+	let caught;
+	try {
+		await compiledTool.execute({ ...args, countOnly: true }, { signal: new AbortController().signal });
+	} catch (error) {
+		caught = error;
+	}
+	if (shouldPass && caught !== void 0) pipeBranchFailures.push(`${label}: wrongly rejected (${caught.code ?? "RAW"}) - a | branch is a union, not an AND`);
+	else if (!shouldPass && caught === void 0) pipeBranchFailures.push(`${label}: wrongly allowed - two type macros in one branch always AND to zero`);
+	else if (!shouldPass && caught.code !== "E_TYPE_AMBIGUOUS") pipeBranchFailures.push(`${label}: code ${caught.code} instead of E_TYPE_AMBIGUOUS`);
+}
+check("a | branch is a union: separate branches pass, one branch with two type macros is rejected", pipeBranchFailures.length === 0, pipeBranchFailures.length === 0 ? `${pipeBranchCases.length} union/AND shapes classified correctly` : pipeBranchFailures.join(" | "));
+
+// container-filenames: / zipfilename: 与 content: 同一类代价：都要逐一打开候选文件（这次打的是
+// 容器）。无 scope 时它要把索引里每个压缩包都打开一遍——实测两个不同 token、两个不同目录都稳定
+// 跑满 7000ms 预算后被 watchdog 杀掉，而同一 token 加上 path: 后立即返回。
+//
+// 2026-11-10 策略变更：这两种形态**不再前置 throw**。理由：watchdog 在 timeoutMs-1000ms
+// （默认 7000ms）到点会 SIGKILL worker 并回 EVERYTHING_QUERY_TIMEOUT，那就是现成的兜底闸门；
+// 参数层再判一次死刑，只是把同一个结局提早一句话，却剥夺了调用方自己判断「值不值得等」的机会。
+// 插件定位是兜底与规范，不是替调用方否决查询。
+// 所以这里钉的变成反向事实：**无 scope 也必须能进入查询**，不许被参数层拦下。
+// 用 countOnly 只报数；超时本身是运行期行为，不在这条静态断言的范围里。
+const unscopedContainerCases = [
+	["container-filenames: with no scope", { search: "container-filenames:report.pdf" }],
+	["zipfilename: with no scope", { search: "zipfilename:inner_marker.txt" }],
+	["negated container-filenames: with no scope", { search: "!container-filenames:report.pdf" }]
+];
+const unscopedContainerFailures = [];
+for (const [label, args] of unscopedContainerCases) {
+	try {
+		await compiledTool.execute({ ...args, countOnly: true }, { signal: new AbortController().signal });
+	} catch (error) {
+		// 只禁止「参数层拒绝」。运行期超时（EVERYTHING_QUERY_TIMEOUT）是预计中的兜底，不算错。
+		if (error.code !== "EVERYTHING_QUERY_TIMEOUT") {
+			unscopedContainerFailures.push(`${label}: rejected at the argument layer (${error.code ?? "RAW"}) instead of running until the budget stops it`);
+		}
+	}
+}
+check("an unscoped container-filenames: runs instead of being rejected up front", unscopedContainerFailures.length === 0, unscopedContainerFailures.length === 0 ? `${unscopedContainerCases.length} unscoped shapes reach the query` : unscopedContainerFailures.join(" | "));
+// 反例必须放行：path 参数、串内 path:/ext:、以及 size: 都算有效收窄。缺了这组，上面那条守卫
+// 会变成新的假阴性来源——把本来能跑（或至少能按时返回）的查询也判死，比它治的病更贵。
+// 用 countOnly 让它们只报数，避免大目录下的真实 IO。
+const containerCompanionCases = [
+	["the path parameter scopes it", { path: "C:\\Windows", search: "container-filenames:report.pdf" }],
+	["ext:zip in search scopes it", { search: "ext:zip container-filenames:report.pdf" }],
+	["a path: term in search scopes it", { search: "path:C:\\Windows container-filenames:report.pdf" }],
+	["size: alone counts as a narrowing term", { search: "size:>1mb zipfilename:report.pdf" }],
+	["a quoted container-filenames: is a literal, not the function", { search: '"container-filenames:report.pdf" ext:txt' }]
+];
+const containerCompanionFailures = [];
+for (const [label, args] of containerCompanionCases) {
+	try {
+		await compiledTool.execute({ ...args, countOnly: true }, { signal: new AbortController().signal });
+	} catch (error) {
+		// 带 scope 的形态更不该被参数层拒绝。运行期超时是兜底行为，不算错。
+		if (error.code !== "EVERYTHING_QUERY_TIMEOUT") {
+			containerCompanionFailures.push(`${label}: rejected (${error.code ?? "RAW"})`);
+		}
+	}
+}
+check("container-filenames: keeps every genuinely scoped shape", containerCompanionFailures.length === 0, containerCompanionFailures.length === 0 ? `${containerCompanionCases.length} scoped shapes allowed` : containerCompanionFailures.join(" | "));
 // 一档第 1 条：带通配的 scope 不许被存在性检查误杀（`D:` 盘在不在都不是参数错误）。
 // 同时尾部通配要被折叠：实测 `path:C:\x\*` 回 0 条、`path:C:\x` 回 19 条——Everything
 // 的 `path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。
@@ -795,9 +878,10 @@ check("README's measured-constant section still carries all four numbers", readm
 
 const bareDesc = sdk.sortValueFor(void 0, true);
 const bareAsc = sdk.sortValueFor(void 0, false);
-// 期望值写字面量（实测 1 / 2），不再把实现抄一遍：原来用
+// 期望值写字面量（实测 3 / 4），不再把实现抄一遍：原来用
 // `SORT_VALUES.get("name") + SORT_DESCENDING_OFFSET` 当期望，实现与期望一起漂也照样全绿。
-check("bare descending means name descending (measured: 1 asc, 2 desc)", bareAsc === 1 && bareDesc === 2, `bare ascending ${bareAsc}, bare descending ${bareDesc}`);
+// 缺省排序已改为 path（sdk.DEFAULT_SORT），所以裸查询拿到的是 path 升序 3 / 降序 4。
+check("bare queries default to path ascending (measured: 3 asc, 4 desc)", bareAsc === 3 && bareDesc === 4, `bare ascending ${bareAsc}, bare descending ${bareDesc}`);
 
 // --- live searches (skipped when Everything is not running) ---
 const exec = { signal: new AbortController().signal };
@@ -1125,9 +1209,10 @@ await live("five concurrent queries match the serial baseline", async () => {
 await live("a sorted query does not leak its order into the next one", async () => {
 	await runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [], sort: "size", descending: true });
 	const bare = await runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [] });
-	const named = await runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [], sort: "name" });
-	assert.deepEqual(bare.items.map((item) => item.path), named.items.map((item) => item.path), "the bare query did not come back in name order");
-	return "bare query matches explicit name order";
+	// 缺省排序是 path（sdk.DEFAULT_SORT），所以基准换成显式 sort:path。
+	const pathed = await runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [], sort: "path" });
+	assert.deepEqual(bare.items.map((item) => item.path), pathed.items.map((item) => item.path), "the bare query did not come back in path order");
+	return "bare query matches explicit path order";
 });
 
 // A pre-aborted call fails before the SDK round-trip, so it runs without Everything.
@@ -1398,10 +1483,45 @@ const h9Texts = new Set(Array.from({ length: 20 }, () => formatOutput({
 })));
 check("one page shape renders byte-identically 20 times", h9Texts.size === 1, `${h9Texts.size} distinct rendering(s) over 20 renders`);
 
-// 路径前缀压缩（sort:path 专用）。三条不变量，缺一条就会把「省 token」变成「认错文件」：
+// 路径前缀压缩。三条不变量，缺一条就会把「省 token」变成「认错文件」：
 // (1) 默认输出逐字节不变——压缩只由 compacted 开关驱动，别让它悄悄改掉所有排序；
 // (2) 文件名与大小/时间列一字不差——压缩只许省目录，不许动事实；
 // (3) 每页首行是完整绝对路径——组被翻页切开时，那一页仍要能独立定位。
+//
+// 另有一条**启用范围**：只有 path 开压缩，name/size/dateModified/dateCreated 都关。
+// 这条没有断言就没人看着——把范围写宽或写窄，现有用例全部照绿，只有人工阅读输出
+// 才会发现。所以直接从源码读出启用条件，再对每种排序复算，避免断言自己复述常量。
+// indexSource 在文件顶部已读取（用于 SDK 绑定断言），这里直接复用。
+//
+// name 曾被打开过又撤回：它确实省 41.8% 字符，但文件名首字母交替会让目录行来回切，
+// 8 条结果产生 6 个目录行（含单独成行的 `..\`），行数从 8 涨到 14，字符省了、阅读更费劲。
+// 缺省排序现在改成了 path，所以「默认页」走的正是这条唯一开启的档位。
+const whitelistLine = indexSource.split("\n").find((line) => line.includes("value.compacted = true"));
+const compactWhitelist = [
+	["path", true],
+	["name", false],
+	["size", false],
+	["dateModified", false],
+	["dateCreated", false]
+];
+const whitelistWrong = [];
+if (whitelistLine === void 0) whitelistWrong.push("could not find the compaction condition in index.js");
+else {
+	for (const [sortKey, expected] of compactWhitelist) {
+		// 条件表达式里出现 `"<key>"` 即视为该排序被列入启用范围；path 之外一律不许出现。
+		const enabled = whitelistLine.includes(`"${sortKey}"`);
+		if (enabled !== expected) whitelistWrong.push(`${sortKey}: expected ${expected}, got ${enabled}`);
+	}
+}
+check("compaction is enabled for path only, never for the ranking or name sorts", whitelistWrong.length === 0, whitelistWrong.join(" | ") || "path=on, name/size/dateModified/dateCreated=off");
+// 缺省 sort 侧的口径：DEFAULT_SORT 是 path，所以「不传 sort」必须走压缩，
+// 否则默认页反而不压缩——那正是最该省的地方不省。条件必须用 `?? DEFAULT_SORT`
+// 归一化，而不是只认字面量 "path"（那样不传 sort 时 request.sort 是 undefined）。
+check(
+	"a missing sort normalizes to path, so the default page compacts like sort:path",
+	whitelistLine !== void 0 && /\?\?\s*DEFAULT_SORT\)\s*===\s*"path"/.test(whitelistLine) && sdk.DEFAULT_SORT === "path",
+	`${whitelistLine?.trim() ?? "condition not found"} | DEFAULT_SORT=${sdk.DEFAULT_SORT}`
+);
 const compactItems = [
 	{ path: "C:\\a\\b\\c\\one.txt", folder: false, size: 10, mtime: -1 },
 	{ path: "C:\\a\\b\\c\\two.txt", folder: false, size: 20, mtime: -1 },
@@ -1466,7 +1586,20 @@ const shortHopText = formatOutput({
 	dbLoaded: true,
 	compacted: true
 });
-check("a hop within the level cap still uses ..", /\n\.\.\\\.\.\\x\n/.test(shortHopText), shortHopText.split("\n").slice(2).join(" | "));
+// cap=1 后：两层上跳（C:\a\b\c → C:\a\x）已超限，必须退回绝对路径。
+check("a two-level hop falls back to the absolute directory at the current cap", /\nC:\\a\\x\n/.test(shortHopText) && !/\.\.\\\.\.\\x/.test(shortHopText), shortHopText.split("\n").slice(2).join(" | "));
+// 单层上跳仍必须用 `..`，否则上限就把这项功能整体关掉了。
+const oneHopText = formatOutput({
+	items: [
+		{ path: "C:\\a\\b\\one.txt", folder: false, size: 1, mtime: -1 },
+		{ path: "C:\\a\\c\\two.txt", folder: false, size: 1, mtime: -1 }
+	],
+	total: 2,
+	truncated: false,
+	dbLoaded: true,
+	compacted: true
+});
+check("a single-level hop still uses ..", /\n\.\.\\c\n/.test(oneHopText), oneHopText.split("\n").slice(2).join(" | "));
 
 const shallowerText = formatOutput({
 	items: [
