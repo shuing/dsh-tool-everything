@@ -592,7 +592,14 @@ const typeConflictCases = [
 	// 其余参数名写进 search：不是 Everything 函数，只会被当字面查询词 AND 成 0 条。
 	["descending: written inside search", { search: "node_modules descending:true" }, "E_PARAM_INLINE"],
 	["offset: written inside search", { search: "node_modules offset:10" }, "E_PARAM_INLINE"],
-	["countOnly: written inside search", { search: "node_modules countOnly:true" }, "E_PARAM_INLINE"]
+	["countOnly: written inside search", { search: "node_modules countOnly:true" }, "E_PARAM_INLINE"],
+	// content: 逐候选文件现读正文，而目录没有正文：任何「只留目录」的断言 AND 上
+	// content: 在任何磁盘状态下都是 0 条。实测同 scope 下 `folder:docs content:"KEY"`
+	// 6 ms 回 0（一个文件都没读），换 `path:docs` 写法 224 ms 才真扫——两种成因不该
+	// 都印成「没找到」。两个来源分开判：串内正向 folder:，以及参数 type: "dir"
+	// （buildSearch 把它渲染成 folder:）。file: 恒为真、!folder: 是排除，都不拦。
+	["folder: macro plus content:", { search: 'docs folder:docs content:"KEY"' }, "E_CONTENT_TYPE_CONFLICT"],
+	["type: dir parameter plus content:", { search: 'docs content:"KEY"', type: "dir" }, "E_CONTENT_TYPE_CONFLICT"]
 ];
 const typeConflictFailures = [];
 for (const [label, conflictArgs, expectedCode] of typeConflictCases) {
@@ -612,6 +619,33 @@ for (const [label, conflictArgs, expectedCode] of typeConflictCases) {
 	else if ([caught.hints.rewrite, caught.hints.alternative].filter((hint) => hint !== void 0).some((hint) => typeof hint.search === "string" && hint.search.trim().length === 0)) typeConflictFailures.push(`${label}: a hint carries an empty search (${JSON.stringify(caught.hints)})`);
 }
 check("every type conflict is a coded argument error carrying an executable rewrite", typeConflictFailures.length === 0, typeConflictFailures.length === 0 ? `${typeConflictCases.length} coded conflicts` : typeConflictFailures.join(" | "));
+// E_CONTENT_TYPE_CONFLICT 只拦「恒空」的那一侧，反例必须放行——否则这条守卫会变成
+// 新的假阴性来源（把能跑的查询也判死），比它治的病更贵。
+//   - file: 与 content: 同现是恒真组合（正文只存在于文件里），实测同 scope 1 条命中；
+//   - !folder: 是排除、不断言类型，实测 3 条命中；
+//   - folder: 不带 content: 是正常查询（列目录）。
+const contentCompanionCases = [
+	// 引号里的是字面量，不是类型断言：`"folder:docs"` 是在文件名里找那 11 个字。
+	// 压测实测：不剥引号时它被 E_TYPE_CONFLICT 判死，而 Everything 那边只是一次正常
+	// 的字面匹配——守卫自己制造假阴性，比它治的病更贵。
+	["a quoted folder: is a literal, not a macro", { search: '"folder:docs" ext:txt content:"KEY"' }],
+	["a quoted folder: without content: stays a literal", { search: '"folder:docs" ext:txt' }],
+	["a file: macro composes with content:", { search: 'file:summary.txt ext:txt content:"KEY"' }],
+	["a negated folder: does not assert a type", { search: '!folder:docs ext:txt content:"KEY"' }],
+	["a folder: macro without content: is a plain directory search", { search: "docs folder:docs" }],
+	["the narrowing term alone still passes", { search: 'docs ext:txt content:"KEY"' }]
+];
+const contentCompanionFailures = [];
+for (const [label, companionArgs] of contentCompanionCases) {
+	try {
+		await compiledTool.execute({ ...companionArgs, countOnly: true }, { signal: new AbortController().signal });
+	} catch (error) {
+		// 别的判死（例如既有的 `!folder:` + ext: 类型撞车）不归这条守卫管，也不能被它冒名；
+		// 这里只钉住一件事：新码不许出现在不相邻的组合上。
+		if (error.code === "E_CONTENT_TYPE_CONFLICT") contentCompanionFailures.push(`${label}: wrongly rejected as a content/type conflict`);
+	}
+}
+check("content: keeps the type assertions that are not contradictory", contentCompanionFailures.length === 0, contentCompanionFailures.length === 0 ? `${contentCompanionCases.length} allowed shapes` : contentCompanionFailures.join(" | "));
 // 一档第 1 条：带通配的 scope 不许被存在性检查误杀（`D:` 盘在不在都不是参数错误）。
 // 同时尾部通配要被折叠：实测 `path:C:\x\*` 回 0 条、`path:C:\x` 回 19 条——Everything
 // 的 `path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。
@@ -1363,6 +1397,149 @@ const h9Texts = new Set(Array.from({ length: 20 }, () => formatOutput({
 	dbLoaded: true
 })));
 check("one page shape renders byte-identically 20 times", h9Texts.size === 1, `${h9Texts.size} distinct rendering(s) over 20 renders`);
+
+// 路径前缀压缩（sort:path 专用）。三条不变量，缺一条就会把「省 token」变成「认错文件」：
+// (1) 默认输出逐字节不变——压缩只由 compacted 开关驱动，别让它悄悄改掉所有排序；
+// (2) 文件名与大小/时间列一字不差——压缩只许省目录，不许动事实；
+// (3) 每页首行是完整绝对路径——组被翻页切开时，那一页仍要能独立定位。
+const compactItems = [
+	{ path: "C:\\a\\b\\c\\one.txt", folder: false, size: 10, mtime: -1 },
+	{ path: "C:\\a\\b\\c\\two.txt", folder: false, size: 20, mtime: -1 },
+	{ path: "C:\\a\\b\\d\\three.txt", folder: false, size: 30, mtime: -1 },
+	{ path: "D:\\elsewhere\\four.txt", folder: false, size: 40, mtime: -1 }
+];
+const compactPlain = formatOutput({ items: compactItems, total: 4, truncated: false, dbLoaded: true });
+const compactText = formatOutput({ items: compactItems, total: 4, truncated: false, dbLoaded: true, compacted: true });
+check("compaction is opt-in and the default rendering is unchanged byte for byte", compactPlain === formatOutput({ items: compactItems, total: 4, truncated: false, dbLoaded: true }) && /^C:\\a\\b\\c\\one\.txt\t/m.test(compactPlain), compactPlain.split("\n")[2]);
+const compactColumns = compactText.split("\n").slice(2).filter((line) => line.includes("\t"));
+check(
+	"a compacted row keeps the same leaf name, size and mtime as the plain row",
+	compactColumns.length === compactItems.length && compactColumns.every((line, index) => {
+		const compacted = line.split("\t");
+		const plainRow = compactPlain.split("\n").slice(2).filter((row) => row.includes("\t"))[index].split("\t");
+		return compacted[0].trim() === plainRow[0].split("\\").pop() && compacted[1] === plainRow[1] && compacted[2] === plainRow[2];
+	}),
+	compactColumns.join(" | ")
+);
+check(
+	"a directory is printed once and repeats collapse to an indented row",
+	/\nC:\\a\\b\\c\n {4}one\.txt\t/.test(compactText) && /\n {4}two\.txt\t/.test(compactText) && !/C:\\a\\b\\c\\two\.txt/.test(compactText),
+	compactText.split("\n").slice(2, 5).join(" | ")
+);
+// 换盘符 `..` 到不了：`C:\a` → `D:\b` 写成 `..\D:\b` 是假路径。必须退回整条绝对路径。
+check("a cross-drive hop falls back to the absolute directory instead of a fake ..\\D:", /\nD:\\elsewhere\n {4}four\.txt\t/m.test(compactText) && !/\.\.[\\/][A-Za-z]:/.test(compactText), compactText.split("\n").slice(-2).join(" | "));
+// 翻页：每页第一行都必须是完整绝对路径，否则「组被切开」的那一页失去定位能力。
+const pageStarts = [];
+for (let start = 0; start < compactItems.length; start++) {
+	const text = formatOutput({ items: compactItems.slice(start), total: 4, truncated: start > 0, offset: start, dbLoaded: true, compacted: true });
+	pageStarts.push(text.split("\n").slice(2).filter((line) => line.length > 0)[0]);
+}
+check("every page starts with a full absolute directory, never a bare .. hop", pageStarts.every((line) => /^[A-Za-z]:\\/.test(line)), pageStarts.join(" | "));
+
+// 压测（500 条真实路径）抓到的三个真 bug，各钉一条，避免修复被回退：
+// (1) 多级上跳曾经只写一个 `..`：`...\Dism++\Config\Languages` → 共享 5 层的
+//     另一个 `图吧工具箱202502\...` 需要 5 个 `..\`，只写一个会指向不存在的兄弟目录。
+// (2) 目录变浅曾经被当成「同目录」：`...\_extract\briefing.zip` 后紧跟
+//     `...\sample.zip`，两者被读成同一个 `_extract`，文件凭空换了目录。
+// (3) 盘符根曾经印成 `C:`，少一个尾分隔符，解析后成 `\C:\...`。
+const deepA = "C:\\L\\202507\\tools\\Config\\Languages\\bg.zip";
+const deepB = "C:\\L\\202502\\tools\\Config\\Data.zip";
+const deepText = formatOutput({
+	items: [deepA, deepB].map((path) => ({ path, folder: false, size: 1, mtime: -1 })),
+	total: 2,
+	truncated: false,
+	dbLoaded: true,
+	compacted: true
+});
+// 深度 6 的 `...\202507\tools\Config\Languages` → 共享 3 层的 `...\202502\tools\Config`
+// 需要跳 4 层，超过 MAX_HOP_LEVELS(3)，所以改为打绝对路径。这条钉的是「要么按层数
+// 老老实实写 ..\，要么退回绝对路径，绝不许写一个层数不够的 ..」。
+check("a deep hop either writes every level or falls back to the absolute directory", /\nC:\\L\\202502\\tools\\Config\n/.test(deepText) && !/\n\.\.\\202502/.test(deepText), deepText.split("\n").slice(2).join(" | "));
+// 三跳以内仍必须用 `..` 压缩，否则上限就把这项功能关掉了。
+const shortHopText = formatOutput({
+	items: [
+		{ path: "C:\\a\\b\\c\\one.txt", folder: false, size: 1, mtime: -1 },
+		{ path: "C:\\a\\x\\two.txt", folder: false, size: 1, mtime: -1 }
+	],
+	total: 2,
+	truncated: false,
+	dbLoaded: true,
+	compacted: true
+});
+check("a hop within the level cap still uses ..", /\n\.\.\\\.\.\\x\n/.test(shortHopText), shortHopText.split("\n").slice(2).join(" | "));
+
+const shallowerText = formatOutput({
+	items: [
+		{ path: "C:\\ev-text-test\\_extract\\briefing.zip", folder: false, size: 1, mtime: -1 },
+		{ path: "C:\\ev-text-test\\sample.zip", folder: false, size: 1, mtime: -1 }
+	],
+	total: 2,
+	truncated: false,
+	dbLoaded: true,
+	compacted: true
+});
+check(
+	"a file one level up gets its own directory line, never inherits the deeper one",
+	/\nC:\\ev-text-test\\_extract\n {4}briefing\.zip\t[\s\S]*\n\.\.\\\n {4}sample\.zip\t/.test(shallowerText),
+	shallowerText.split("\n").slice(2).join(" | ")
+);
+
+const rootText = formatOutput({
+	items: [
+		{ path: "C:\\one.txt", folder: false, size: 1, mtime: -1 },
+		{ path: "C:\\sub\\two.txt", folder: false, size: 2, mtime: -1 }
+	],
+	total: 2,
+	truncated: false,
+	dbLoaded: true,
+	compacted: true
+});
+check("a drive root keeps its trailing separator so it stays a directory", /\nC:\\\n {4}one\.txt\t/.test(rootText), rootText.split("\n").slice(2).join(" | "));
+
+// 端到端还原：压缩输出必须能被一个独立解析器还原成原始路径。这是唯一能证明
+// 「省 token 没有换掉定位能力」的检查——上面各条只钉单个形状。
+const resolveCompacted = (text) => {
+	const body = (text.split("\n\n")[1] ?? "").split("\n");
+	const resolved = [];
+	let current = null;
+	for (const line of body) {
+		if (line.startsWith("    ")) {
+			const base = current.endsWith("\\") ? current.slice(0, -1) : current;
+			resolved.push(`${base}\\${line.trim().split("\t")[0]}`);
+			continue;
+		}
+		if (line.length === 0) continue;
+		if (/^[A-Za-z]:\\/.test(line)) {
+			current = line;
+			continue;
+		}
+		const parts = (current.endsWith("\\") ? current.slice(0, -1) : current).split("\\");
+		for (const segment of line.split("\\")) {
+			if (segment === "..") parts.pop();
+			else if (segment !== "" && segment !== ".") parts.push(segment);
+		}
+		current = parts.join("\\");
+	}
+	return resolved;
+};
+const roundTripPaths = [
+	"C:\\a\\b\\c\\one.txt",
+	"C:\\a\\b\\c\\two.txt",
+	"C:\\a\\b\\d\\three.txt",
+	"C:\\a\\four.txt",
+	"C:\\x\\y\\z\\five.txt",
+	"D:\\other\\six.txt",
+	"C:\\seven.txt"
+];
+const roundTripText = formatOutput({
+	items: roundTripPaths.map((path) => ({ path, folder: false, size: 1, mtime: -1 })),
+	total: roundTripPaths.length,
+	truncated: false,
+	dbLoaded: true,
+	compacted: true
+});
+const roundTrip = resolveCompacted(roundTripText);
+check("a compacted page round-trips to the exact original paths", JSON.stringify(roundTrip) === JSON.stringify(roundTripPaths), `${JSON.stringify(roundTrip)}`);
 
 // FIX-10：清单的另外两种等价写法（正斜杠、尾分隔符）与直连目录同数，各 20 次。
 // 上一轮只覆盖了直连、`*`、`\*`、`\**` 四种，这里补齐 T 组的另两种。

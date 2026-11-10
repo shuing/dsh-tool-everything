@@ -1,6 +1,6 @@
 # dsh-tool-everything 架构
 
-本文件回答「为什么这样实现」，不是使用说明。参数、错误码与调用原则见 `README.md`，可执行的契约在 `test/verify.mjs`。文中的 `文件:行号` 按 0.5.0 的源码写，只作定位线索：断言一律钉在行为上，不钉行号；插一个 import 就会整体下移一行，行号漂了以代码为准。
+本文件回答「为什么这样实现」，不是使用说明。参数、错误码与调用原则见 `README.md`，可执行的契约在 `test/verify.mjs`。文中的 `文件:行号` 与行数按 **0.5.3** 的源码写，只作定位线索：断言一律钉在行为上，不钉行号；插一个 import 就会整体下移一行，行号漂了以代码为准（本轮同步时逐条核对过 7 处关键行号与 8 个文件的行数）。
 
 ## 1. 数据流
 
@@ -11,7 +11,7 @@
 3. `lib/components/everything/index.js:397` `runQueryUnlocked`（实例版是 `:409` 的 `runQueryUnlockedOn`）—— 组请求体：`buildSearch`（`path:` / `file:` / `folder:` / `!path:` 全在这里拼）、`sort`、`offset`；请求 flags 由 worker 侧按 `countOnly` 决定。
 4. `lib/components/everything/index.js:210` `askWorker` → `new Worker(fileURLToPath(WORKER_URL))`（`WORKER_URL` 在 `:104`，值取自 `lib/paths.mjs:19` 的 `workerUrl`，指向 `lib/components/everything/query-worker.mjs`）→ `postMessage`。
 5. `lib/components/everything/sdk.mjs:220` `loadSdk` → `koffi.load(native/Everything64.dll)` → 绑定 `Everything_Set*` / `Everything_QueryW` / `Everything_Get*`（`lib/components/everything/sdk.mjs:233-257`）。
-6. worker 回一条消息 → `lib/components/everything/index.js:153` 的 `message` 监听 → `settleRequest`（`:174`）→ `runQueryUnlockedOn` 组装 value → `formatOutput`（定义在 `lib/shared/format.mjs:47`，调用在 `lib/components/everything/index.js:590`）出模型可读文本，`presentationMeta`（`:592`）出搜索卡片。
+6. worker 回一条消息 → `lib/components/everything/index.js:153` 的 `message` 监听 → `settleRequest`（`:174`）→ `runQueryUnlockedOn` 组装 value（`sort:path` 时置 `value.compacted`，见第 6 节）→ `formatOutput`（定义在 `lib/shared/format.mjs:147`，调用在 `lib/components/everything/index.js:930`）出模型可读文本，`presentationMeta`（`:932`）出搜索卡片。
 
 主线程只做拼串、校验与格式化；阻塞的 `Everything_QueryW` 只在 worker 里跑。
 
@@ -50,12 +50,36 @@
 
 ## 5. 组件结构：为什么拆成两条组件行
 
-两条组件行各管一面，`wc -l` 实测：包本体外壳 `lib/index.js` 229 行、文件名组件 `lib/components/everything/index.js` 784 行、内容组件 `lib/components/anytxt/index.js` 392 行（它的 JSON-RPC 客户端 `lib/components/anytxt/anytxt.mjs` 624 行）；共享件四份 `lib/shared/format.mjs` 109 行、`lib/shared/type-name.mjs` 14 行、`lib/shared/prompt-orders.mjs` 13 行、`lib/shared/config.mjs` 25 行；`lib/paths.mjs` 是 DLL 路径与 worker 入口的唯一一处定义。拆的理由是结构需求，不是行数：
+两条组件行各管一面，`wc -l` 实测：包本体外壳 `lib/index.js` 234 行、文件名组件 `lib/components/everything/index.js` 1347 行、内容组件 `lib/components/anytxt/index.js` 473 行（它的 JSON-RPC 客户端 `lib/components/anytxt/anytxt.mjs` 776 行）；共享件四份 `lib/shared/format.mjs` 277 行、`lib/shared/type-name.mjs` 14 行、`lib/shared/prompt-orders.mjs` 13 行、`lib/shared/config.mjs` 25 行；`lib/paths.mjs` 是 DLL 路径与 worker 入口的唯一一处定义。拆的理由是结构需求，不是行数：
 
 - 开关要与能力面一一对应。注册点搬进各组件的 `apply(ctx, caps)`，外壳只做「探测宿主能力 → 组 caps」，注册全交给行自己；关掉 `file` 那一行，`everything_*` 随之不在、`anytxt_*` 照常上线，只开 `file` 则反之。注册留在外壳时开关只是装饰。证据是 `test/verify.mjs` 的四组合用例（都不加载／只 file／只 content／两面全接），断言工具名集合与 prompt 段 order 集合逐字相等。
 - 文案与 schema 的唯一来源跟着注册面走：`buildParameters`、`applyTool` 的 tool description 与 prompt 段在文件面组件里，四个 `anytxt_*` 工具与那段 prompt 在内容面组件里。共享件只有三处——`format.mjs` 出模型可读文本、`type-name.mjs` 出探测的 expected/got、`prompt-orders.mjs` 是 order 的唯一来源（一行一个数，不许 `+1` 之类算术）。
 - 实测常量的唯一来源仍是 `lib/components/everything/sdk.mjs`（主线程与 worker 共用一份），两份必漂；DLL 路径与 worker 入口收到 `lib/paths.mjs`，从 `lib/` 起算、不数 `../` 层数，搬文件不会指错地方。
 - 触发再拆的条件仍是结构需求，不是行数：接入第二个引擎，或出现日志与路由需求。
+
+## 6. `sort:path` 的前缀压缩：只省目录，不动事实
+
+`sort:path` 时正文按「目录打一次 + 文件缩进」渲染，重复的目录前缀不再每行重印。这是**纯呈现层**改动，三个不变量决定了它的边界：
+
+- **只在 `sort:path` 开启**。Everything 按路径排序时同目录天然相邻；按 `name` / `size` 排序时目录被打散（实测同一份 500 条：name 151 段、size 164 段、path 仅 90 段，目录唯一数 89），此时压缩只会把 `..\` 乱跳堆给读的人。开关落在 `lib/components/everything/index.js:782` 的 `value.compacted`，`formatOutput` 只读这个布尔值（`lib/shared/format.mjs:211`），不参与排序决策、参数校验或分页计算。
+- **只缩短目录**。文件名与「大小 / 本地时间」两列与 `formatItem` 逐字节相同（`lib/shared/format.mjs:64` 与 `:108` 共用同一套 `formatSize` / `formatMtime`），所以压缩行仍然携带同样的事实，只是不再重复一个已经在屏幕上的目录。
+- **分页契约一字未动**。`nextOffset` 仍是 `offset + items.length`；每页首行的 `previous` 恒为 `undefined`，因此**每页第一行永远是完整绝对路径**——组被翻页切开时，那一页仍能独立定位。这是「页内连续、页间不保证组完整」这一取舍能被接受的前提。
+
+四条出口（`lib/shared/format.mjs:108` `formatItemCompacted`）各有实测依据，没有一条是保险起见加的：
+
+| 出口 | 触发条件 | 为什么不能写跳转 |
+| --- | --- | --- |
+| 绝对目录行 | 首行（`previous` 未定义） | 页首必须自足，否则单独看这一页无法定位 |
+| 绝对目录行 | 换盘符（`dirs[0] !== previous[0]`） | `..` 到不了另一块盘，`..\D:\b` 是不存在的路径 |
+| 绝对目录行 | 上跳层数 > `MAX_HOP_LEVELS`(3) | 点号比省下的前缀还长，且没有人能数清十层 `..` |
+| 纯缩进行 | 同目录（`shared === dirs.length && dirs.length === previous.length`） | 目录已在上一行，重印纯属冗余 |
+| `..\` 前缀行 | 其余情况 | 上跳层数 = 上一层目录深度 − 共享段数 |
+
+上跳层数必须**按层数写**，不能固定一个 `..`：从深度 10 的 `...\Dism++\Config\Languages` 跳到共享 5 层的另一个 `图吧工具箱202502\...` 只写一个 `..`，会解析到 `...\Dism++\Config\..\图吧工具箱202502`——一个不存在的兄弟目录。同理，`shared === dirs.length` 不等于「同目录」：**目录变浅**时它也成立（`C:\a\b` 之后出现 `C:\a` 的文件），若只打缩进行，那个文件会被读成仍在更深的 `b` 里。两条都是真实页面上抓到的，钉在 `test/verify.mjs` 里。
+
+`MAX_HOP_LEVELS = 3` 是量出来的，不是拍的：一份 13 行的真实样本里，最深一跳写了 10 个 `..\`，所有跳转行加起来占压缩版 **31%**，页面总节省跌到 21%——省下的目录前缀又被点号还了回去，还多出一堆数不清的点；加上限后跳转占比降到 **6.9%**，总节省反而升到 22.3%。
+
+**还原能力是这项功能的验收标准**，不是体积。`test/verify.mjs` 里有一条端到端用例：用一个**独立实现**的解析器（`..` 逐段上跳）把压缩输出还原成原始路径序列，再与输入逐条比对——这是唯一能证明「省 token 没有换掉定位能力」的检查，只钉输出形状盖不住。500 条真实路径的还原率是 500/500，体积 69467 → 34587 字符（约 −50%）。
 
 ## exports 与组件入口
 
