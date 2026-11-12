@@ -7,13 +7,24 @@
 一次 `everything_search` 调用，从工具入口到 DLL 只有一条路：
 
 1. `lib/components/everything/index.js:598` `execute(args, exec)` —— `assertSignal`（一次性探针，定义在 `:92`）、`parseArgs`、`maxResults` / `offset` 钳位、`exclude` 解析、`sort` / `type` 白名单校验、`countOnly` 与正 `offset` 互斥。
-2. `lib/components/everything/index.js:393` `runQuery` —— 每个实例一条在途链 `rt.chain`（实例由 `createQueryRuntime():115` 建），一次只放一条请求进 worker（并发是排队，不是并行）。
+2. `runQueryOn`（`lib/components/everything/index.js`）—— 每个实例一把槽位限流器 `rt.slots`（实例由 `createQueryRuntime()` 建；限流器在 `lib/shared/slots.mjs`）。容量取自 `caps.concurrency`（默认 1 = 旧的单在途链逐字等价）：容量之内的查询**真正并行**，各自租一个 forked 子进程；超出容量的调用进 FIFO 队列，**排队窗口 = `min(WATCHDOG_SLACK_MS, timeoutMs - WATCHDOG_MIN_MS)`（默认 1s）**，用尽即抛具名 `EVERYTHING_BUSY`。窗口要绑死在这段 slack 上，因为宿主预算按墙钟算、覆盖「排队 + 执行」，而 watchdog 只从拿到槽位后才起计。工具另声明 `isConcurrencySafe: () => true`，宿主才会把同批查询放进滚动池（未声明 = 独占串行）。
 3. `lib/components/everything/index.js:397` `runQueryUnlocked`（实例版是 `:409` 的 `runQueryUnlockedOn`）—— 组请求体：`buildSearch`（`path:` / `file:` / `folder:` / `!path:` 全在这里拼）、`sort`、`offset`；请求 flags 由 worker 侧按 `countOnly` 决定。
-4. `lib/components/everything/index.js:210` `askWorker` → `new Worker(fileURLToPath(WORKER_URL))`（`WORKER_URL` 在 `:104`，值取自 `lib/paths.mjs:19` 的 `workerUrl`，指向 `lib/components/everything/query-worker.mjs`）→ `postMessage`。
+4. `lib/components/everything/index.js:486` `askWorker` → `acquireWorker`（`:404`，先复用池里的空闲子进程，一个都没有才 `forkWorker` `:369`）→ `child.send(request)`；worker 入口 `WORKER_URL` 取自 `lib/paths.mjs` 的 `workerUrl`，指向 `lib/components/everything/query-worker.mjs`。
 5. `lib/components/everything/sdk.mjs:220` `loadSdk` → `koffi.load(native/Everything64.dll)` → 绑定 `Everything_Set*` / `Everything_QueryW` / `Everything_Get*`（`lib/components/everything/sdk.mjs:233-257`）。
-6. worker 回一条消息 → `lib/components/everything/index.js:153` 的 `message` 监听 → `settleRequest`（`:174`）→ `runQueryUnlockedOn` 组装 value（`sort:path` 时置 `value.compacted`，见第 6 节）→ `formatOutput`（定义在 `lib/shared/format.mjs:147`，调用在 `lib/components/everything/index.js:930`）出模型可读文本，`presentationMeta`（`:932`）出搜索卡片。
+6. 某个子进程回一条消息 → `lib/components/everything/index.js:369` 里该子进程的 `message` 监听（先查它手上有没有租约，没有就是迟到回复，直接丢）→ `settleRequest`（`:420`，按租约结算、把子进程放回空闲）→ `runQueryUnlockedOn` 组装 value（`sort:path` 时置 `value.compacted`，见第 6 节）→ `formatOutput`（定义在 `lib/shared/format.mjs:147`，调用在 `lib/components/everything/index.js:930`）出模型可读文本，`presentationMeta`（`:932`）出搜索卡片。
 
-主线程只做拼串、校验与格式化；阻塞的 `Everything_QueryW` 只在 worker 里跑。
+主线程只做拼串、校验与格式化；阻塞的 `Everything_QueryW` 只在 worker 子进程里跑。
+
+**为什么并发度只能等于子进程数**：`SetSearchW` / `SetMax` / `SetSort` 是 **SDK 的进程级状态**，同一子进程里并发跑两条必然互相踩（`query-worker.mjs` 里那个 `busy` 标志就是为此存在）。所以并发靠「多个子进程」实现，回复归属按**租约**（`rt.leases`：子进程 → 它正服务的请求）判定——一个子进程同一时刻只服务一条查询，「哪个子进程回的」就是天然的归属键，不需要请求 id 表。
+
+## 1b. 配置界面（客户端半边）
+
+`lib/client.js` 向宿主「插件」页注册槽位 `plugins.row.config`，key = `<包名>#<行 id>`（本例 `dsh-tool-everything#dsh-tool-everything-everything`）。没有这个注册，那一行在 UI 里就只有一个启停开关。
+
+两处容易踩的坑，都是实测出来的：
+
+1. **字段必须标 `.volatile()`**。宿主 `dsh-settings` 的 `volatileForm()` 只保留 `schema.meta.volatile` 为真的字段；全被过滤掉时 `describe()` 不产出这一项，页面拿到的 `form` 是 `undefined`（表现为「这一行暂时拿不到表单」）。
+2. **标了 `.volatile()` 后，`apply(ctx, config)` 里拿到的是响应式引用**（带 `get()` 的对象），不是裸值。`Number.isInteger(引用)` 恒为假——不在读配置处解包，插件会在启动时报 `maxResults must be a positive integer`。宿主的 `plainConfig()` 就是调 `get()` 解包，插件侧（外壳 `configValue()` 与 `resolveFileCaps`）必须同口径。
 
 ## 2. 只读边界
 
@@ -96,6 +107,8 @@
 ## exports 与组件入口
 
 `package.json` 的 `exports` 里，`./everything`、`./anytxt` 两条是组件入口，各自指向 `lib/components/<组件>/index.js`；同名的 `./<组件>/package.json` 是给 loader 读组件身份用的。
+
+`"./client"` 是**客户端半边入口**，指向 `lib/client.js`，配合 `dsh.client.platform = "web"` 使用：宿主的 client-modules 按 `exports["./client"]` 找到这个包在浏览器里的 bundle。该文件是手写的 UMD 包装（`window.__ModuleLoader__.load({id, factory})`，与 tsdown 产物同形），所以没有构建步骤；`files` 里也必须列上它，否则发布后浏览器端 404。
 
 `"./*": "./*"` 是**兼容兜底，不是组件入口**：`exports` 一旦加上就会关掉子路径通配，而 `test/verify.mjs` 按路径直接 import `lib/components/everything/sdk.mjs`，删掉这条会断测试，也会断既有按路径消费的调用方。它与 `"//exports"` 那条顶层说明键成对出现，任何一次搬文件之后都要重核它是否还够用。
 

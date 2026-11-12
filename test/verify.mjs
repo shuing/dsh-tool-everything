@@ -14,18 +14,24 @@ const readRepoFile = (relative) => readFileSync(path.join(repoRoot, relative), "
 const plugin = await import(pathToFileURL(path.join(repoRoot, "lib", "index.js")).href);
 // 0.4.1：排序取值在 sdk 侧，裸 descending 的语义只能在那一层钉住。
 const sdk = await import(pathToFileURL(path.join(repoRoot, "lib", "components", "everything", "sdk.mjs")).href);
+// 并发调度那一层是纯逻辑（无定时器、不碰 Everything64.dll），所以离线就能测；下面的
+// live 并发用例只在 Everything 真在跑的机器上才拿得到证据。
+const slots = await import(pathToFileURL(path.join(repoRoot, "lib", "shared", "slots.mjs")).href);
 
 const {
 	Config,
+	DEFAULT_CONCURRENCY,
 	DEFAULT_EXCLUDE_PATHS,
 	DEFAULT_MAX_RESULTS,
 	EverythingError,
 	HOST_ERROR_CODES,
+	MAX_CONCURRENCY,
 	MAX_RESULTS_CAP,
 	OFFSET_CAP,
 	SEARCH_TIMEOUT_MS,
 	assertSignal,
 	buildSearch,
+	createQueryRuntime,
 	describeLastError,
 	formatItem,
 	formatOutput,
@@ -135,7 +141,7 @@ try {
 	compileError = error;
 }
 check("the real tool definition compiles", compileError === void 0 && compiledTool?.name === "everything_search", compileError === void 0 ? "everything_search compiled" : `${compileError.code ?? compileError.name}: ${compileError.message}`);
-check("compiled parameters expose every documented argument", Object.keys(compiledTool?.parameters?.properties ?? {}).join(",") === "search,path,pathMustExist,allDrives,maxResults,offset,exclude,sort,descending,countOnly,type", Object.keys(compiledTool?.parameters?.properties ?? {}).join(","));
+check("compiled parameters expose every documented argument", Object.keys(compiledTool?.parameters?.properties ?? {}).join(",") === "search,path,pathMustExist,maxResults,offset,exclude,sort,descending,countOnly,type", Object.keys(compiledTool?.parameters?.properties ?? {}).join(","));
 check("only search is required", Array.isArray(compiledTool?.parameters?.required) && compiledTool.parameters.required.length === 1 && compiledTool.parameters.required[0] === "search", JSON.stringify(compiledTool?.parameters?.required));
 // 0.4.8-1：README 参数表与编译出的 schema 互校——十个参数一个都不能漏，以后加参数不更
 // 文档先红。顺带钉住两件文档漂过的事：maxResults 的默认值只指向常量、不写死 30（0.3.0
@@ -144,7 +150,7 @@ check("only search is required", Array.isArray(compiledTool?.parameters?.require
 const readmeParamSource = readRepoFile("README.md");
 const schemaParams = Object.keys(compiledTool?.parameters?.properties ?? {});
 const undocumentedParams = schemaParams.filter((name) => !readmeParamSource.includes("| `" + name + "` |"));
-check("README documents every parameter of the compiled schema", schemaParams.length === 11 && undocumentedParams.length === 0, undocumentedParams.length === 0 ? `${schemaParams.length} parameters documented` : `missing: ${undocumentedParams.join(", ")}`);
+check("README documents every parameter of the compiled schema", schemaParams.length === 10 && undocumentedParams.length === 0, undocumentedParams.length === 0 ? `${schemaParams.length} parameters documented` : `missing: ${undocumentedParams.join(", ")}`);
 check("README points at DEFAULT_MAX_RESULTS instead of pinning 30", /DEFAULT_MAX_RESULTS/.test(readmeParamSource) && !/默认\s*30/.test(readmeParamSource), "no hardcoded 30 default");
 check("README spells the three header forms out", readmeParamSource.includes("Found N of M results (offset X)") && readmeParamSource.includes("Found M results") && readmeParamSource.includes("shown N / total M / nextOffset X"), "header forms documented");
 // 内容侧三条工具的参数键集、required 与输出形状统一在下面「the anytxt tool face」
@@ -528,35 +534,24 @@ try {
 check("a missing scope names the nearest existing parent and the ways out", /nearest existing parent: C:\\/.test(missingScopeMessage) && !/wildcard scope/.test(missingScopeMessage) && /omit path:/.test(missingScopeMessage) && /pathMustExist: false/.test(missingScopeMessage), missingScopeMessage);
 // pathMustExist:false 才降级：scope 被丢掉、整盘照搜，并由 notes 回报、结果头明写。
 const ignoreNotes = {};
-// 全盘回退要两次确认：`pathMustExist: false` 单独出现是参数错误（下面第二条断言），
-// 只有再加 `allDrives: true` 才真的丢掉 scope。漏路径就丢 scope 等于搜整个索引，实测 22541 条。
-const ignoredScopeSearch = buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42", pathMustExist: false, allDrives: true }, [], ignoreNotes);
-check("pathMustExist:false with allDrives:true drops the scope instead of throwing", ignoredScopeSearch === "*.dll" && ignoreNotes.ignoredScope === "C:\\definitely missing dir 42", `${ignoredScopeSearch} / ${ignoreNotes.ignoredScope}`);
-let halfConfirmedError;
-try {
-	buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42", pathMustExist: false });
-} catch (error) {
-	halfConfirmedError = error;
-}
-check("a missing scope with pathMustExist:false alone is rejected, naming allDrives", halfConfirmedError instanceof Error && /allDrives: true/.test(halfConfirmedError.message) && /whole-index fallback/.test(halfConfirmedError.message) && /nearest existing parent: C:\\/.test(halfConfirmedError.message), halfConfirmedError === void 0 ? "no error thrown" : halfConfirmedError.message);
-let allDrivesAloneError;
-try {
-	await compiledTool.execute({ search: "*.dll", allDrives: true }, { signal: new AbortController().signal });
-} catch (error) {
-	allDrivesAloneError = error;
-}
-check("allDrives without pathMustExist:false is rejected instead of doing nothing", allDrivesAloneError instanceof Error && /allDrives only authorises the whole-index fallback/.test(allDrivesAloneError.message), allDrivesAloneError === void 0 ? "no error thrown" : allDrivesAloneError.message);
-const ignoredScopeHeader = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, pathIgnored: "C:\\definitely missing dir 42" }).split("\n")[0];
-check("the header says a dropped path was ignored", /path ignored: does not exist/.test(ignoredScopeHeader), ignoredScopeHeader);
-// P0-3：scope 不存在是带码的参数错误，不再只是一句自由文案。默认路径报 E_SCOPE_DROPPED；
-// 显式 allDrives:true 才走「授权后丢 scope」那条，结果头写明结果不来自该目录。
-let droppedScopeCode;
+// 2026-11-11：二次确认（allDrives）已删除。原先「只传 pathMustExist:false」是一个不落地的
+// 中间档——它照样抛错，只换成一句「请再补 allDrives」。不产生任何行为的档位只会让调用方
+// 多失败一次，所以 pathMustExist:false 自己就是授权：丢 scope + 结果头写 path ignored。
+const ignoredScopeSearch = buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42", pathMustExist: false }, [], ignoreNotes);
+check("pathMustExist:false alone drops the scope instead of throwing", ignoredScopeSearch === "*.dll" && ignoreNotes.ignoredScope === "C:\\definitely missing dir 42", `${ignoredScopeSearch} / ${ignoreNotes.ignoredScope}`);
+// 默认（不传 / true）仍是硬门禁：这是真有用的那一半，一字不动。
+let strictScopeError;
 try {
 	buildSearch({ search: "*.dll", path: "C:\\definitely missing dir 42" });
 } catch (error) {
-	droppedScopeCode = error;
+	strictScopeError = error;
 }
-check("a missing scope carries the E_SCOPE_DROPPED code", droppedScopeCode?.code === "E_SCOPE_DROPPED", droppedScopeCode === void 0 ? "no error thrown" : `${droppedScopeCode.code}: ${droppedScopeCode.message}`);
+check("a missing scope without pathMustExist:false still errors", strictScopeError?.code === "E_SCOPE_DROPPED" && /nearest existing parent: C:\\/.test(strictScopeError.message) && /pathMustExist: false/.test(strictScopeError.message), strictScopeError === void 0 ? "no error thrown" : strictScopeError.message);
+const ignoredScopeHeader = formatOutput({ items: [], total: 0, truncated: false, dbLoaded: true, pathIgnored: "C:\\definitely missing dir 42" }).split("\n")[0];
+check("the header says a dropped path was ignored", /path ignored: does not exist/.test(ignoredScopeHeader), ignoredScopeHeader);
+// P0-3 的「默认路径报 E_SCOPE_DROPPED」已由上面那条 "a missing scope without
+// pathMustExist:false still errors" 覆盖（同一个调用、同一个断言目标），这里不再重复
+// 构造一次——两份相同的期望值只会各自漂移。
 // 0.4.7-2：type 渲染成 Everything 自己的 file:/folder:（零新 SDK 绑定，实测
 // node_modules folder: 393 / file: 2 对着全量 33307）。串里已带 file:/folder: 时不重复
 // 追加——两个词 AND 成 0 条，静默归零最贵，所以「没追加」做成值字段并上结果头。
@@ -707,7 +702,7 @@ for (const [label, args] of unscopedContainerCases) {
 	}
 }
 check("an unscoped container-filenames: runs instead of being rejected up front", unscopedContainerFailures.length === 0, unscopedContainerFailures.length === 0 ? `${unscopedContainerCases.length} unscoped shapes reach the query` : unscopedContainerFailures.join(" | "));
-// 反例必须放行：path 参数、串内 path:/ext:、以及 size: 都算有效收窄。缺了这组，上面那条守卫
+// 反例必须放行：path 参数、串内 (path:, ext:) 以及 size: 都算有效收窄。缺了这组，上面那条守卫
 // 会变成新的假阴性来源——把本来能跑（或至少能按时返回）的查询也判死，比它治的病更贵。
 // 用 countOnly 让它们只报数，避免大目录下的真实 IO。
 const containerCompanionCases = [
@@ -882,6 +877,81 @@ const bareAsc = sdk.sortValueFor(void 0, false);
 // `SORT_VALUES.get("name") + SORT_DESCENDING_OFFSET` 当期望，实现与期望一起漂也照样全绿。
 // 缺省排序已改为 path（sdk.DEFAULT_SORT），所以裸查询拿到的是 path 升序 3 / 降序 4。
 check("bare queries default to path ascending (measured: 3 asc, 4 desc)", bareAsc === 3 && bareDesc === 4, `bare ascending ${bareAsc}, bare descending ${bareDesc}`);
+
+// --- 并发闸门（离线，纯逻辑） ---
+// 这一层单独成模块就是为了能被这里钉住：live 并发用例需要 Everything 在跑（没装就只能 SKIP），
+// 而「容量有没有守住、释放会不会漏、缩容会不会误伤在跑的查询」跟 Everything 一点关系都没有。
+{
+	check("normalizeLimit folds junk into [1, cap]", slots.normalizeLimit(void 0) === 1 && slots.normalizeLimit(-3) === 1 && slots.normalizeLimit(2.9) === 2 && slots.normalizeLimit(99, 8) === 8, `${slots.normalizeLimit(void 0)}/${slots.normalizeLimit(-3)}/${slots.normalizeLimit(2.9)}/${slots.normalizeLimit(99, 8)}`);
+
+	const limiter = slots.createSlotLimiter(2, 8);
+	const order = [];
+	const hold = async (tag) => {
+		await limiter.acquire();
+		order.push(tag);
+		await new Promise((resolve) => setTimeout(resolve, 1));
+		limiter.release();
+	};
+	await Promise.all([hold("a"), hold("b"), hold("c"), hold("d")]);
+	check("four holders on a two-slot limiter never exceed the limit", limiter.peak === 2 && limiter.active === 0 && limiter.waiting === 0, `peak ${limiter.peak}, active ${limiter.active}, order ${order.join("")}`);
+	check("queued holders are admitted in FIFO order", order.join("") === "abcd", order.join(""));
+
+	const thrower = slots.createSlotLimiter(1, 8);
+	let threw = false;
+	try {
+		await thrower.run(async () => {
+			throw new Error("boom");
+		});
+	} catch {
+		threw = true;
+	}
+	check("run() releases the slot when the task throws", threw && thrower.active === 0 && thrower.waiting === 0, `active ${thrower.active}, waiting ${thrower.waiting}, threw ${threw}`);
+
+	const resized = slots.createSlotLimiter(1, 8);
+	await resized.acquire();
+	const queued = resized.acquire();
+	check("a second acquire waits while the only slot is held", resized.active === 1 && resized.waiting === 1, `active ${resized.active}, waiting ${resized.waiting}`);
+	check("widening the limiter admits a queued waiter immediately", resized.resize(2) === 2 && resized.waiting === 0, `limit ${resized.limit}, waiting ${resized.waiting}`);
+	await queued;
+	check("the admitted waiter holds a real slot", resized.active === 2 && resized.peak === 2, `active ${resized.active}, peak ${resized.peak}`);
+	resized.release();
+	resized.release();
+	check("both holders drain back to zero", resized.active === 0, `active ${resized.active}`);
+	check("the limiter clamps a resize into [1, cap]", resized.resize(0) === 1 && resized.resize(1e9) === 8 && resized.resize(Number.NaN) === 1, `${resized.resize(0)}/${resized.resize(1e9)}/${resized.resize(Number.NaN)}`);
+
+	// 排队窗口：超时的等待者要能自己摘出队列，否则名额会泄漏给一个没人等的等待者。
+	const gated = slots.createSlotLimiter(1, 8);
+	await gated.acquire();
+	const gaveUp = await gated.acquireWithin(5);
+	check("acquireWithin gives up after its window and leaves no waiter behind", gaveUp === false && gated.waiting === 0 && gated.active === 1, `admitted=${gaveUp}, waiting=${gated.waiting}, active=${gated.active}`);
+	const freed = gated.acquireWithin(500);
+	setTimeout(() => gated.release(), 20);
+	check("acquireWithin is admitted when a slot frees inside its window", (await freed) === true && gated.active === 1, `active=${gated.active}`);
+	gated.release();
+
+	const leaky = slots.createSlotLimiter(1, 8);
+	await leaky.acquire();
+	const timedOut = await leaky.acquireWithin(5);
+	leaky.release();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	check("a timed-out waiter is never admitted later (no leaked permit)", timedOut === false && leaky.active === 0 && leaky.waiting === 0, `active=${leaky.active}, waiting=${leaky.waiting}`);
+
+	// 队列满即具名失败：拿不到槽位时根本不会 fork，所以这条离线也能跑。
+	// timeoutMs 1200 → 排队窗口 = min(WATCHDOG_SLACK_MS, 1200-1000) = 200ms。
+	const busyRuntime = createQueryRuntime();
+	await busyRuntime.slots.acquire();
+	let busyError;
+	try {
+		await busyRuntime.runQuery({ signal: new AbortController().signal }, { search: "ext:dll" }, { maxResults: 5, timeoutMs: 1200, exclude: [] });
+	} catch (error) {
+		busyError = error;
+	}
+	busyRuntime.slots.release();
+	check("a call that cannot get a slot fails fast with EVERYTHING_BUSY", busyError?.code === "EVERYTHING_BUSY" && /concurrency 1/.test(busyError?.message ?? "") && /retry shortly/.test(busyError?.message ?? ""), `${busyError?.code ?? "no error"}: ${(busyError?.message ?? "").slice(0, 110)}`);
+
+	check("the plugin's DEFAULT_CONCURRENCY is the serial legacy value", DEFAULT_CONCURRENCY === 1 && DEFAULT_CONCURRENCY === slots.normalizeLimit(void 0), String(DEFAULT_CONCURRENCY));
+	check("the plugin's MAX_CONCURRENCY is the limiter's MAX_SLOTS", MAX_CONCURRENCY === slots.MAX_SLOTS && MAX_CONCURRENCY === 8, `${MAX_CONCURRENCY} / ${slots.MAX_SLOTS}`);
+}
 
 // --- live searches (skipped when Everything is not running) ---
 const exec = { signal: new AbortController().signal };
@@ -1192,17 +1262,25 @@ await live("aborting row A before reloading row B keeps row A's code SEARCH_ABOR
 	return "row A kept SEARCH_ABORTED across row B's reload";
 });
 
-// P2 契约：五条并发逐条对上串行基线（单在途链，不许交叉）。2a 之后走行句柄。
-await live("five concurrent queries match the serial baseline", async () => {
+// P2 契约（并发化后）：并发只改「同时在途几条」，不改「结果是什么」——同一条查询在并发
+// 与串行下必须给出逐字节一致的分页；同时并发度要真的起来（peak > 1），否则这条用例只是
+// 把串行跑了两遍。2a 之后走行句柄。
+await live("concurrent queries keep the serial results and actually overlap", async () => {
 	const offsets = [0, 5, 10, 15, 20];
 	const rowRuntime = runtimeFor(rowA.ctx);
-	const query = (offset) => rowRuntime.runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [], offset });
+	const query = (offset, concurrency) => rowRuntime.runQuery(exec, { search: "*.dll" }, { ...base, maxResults: 5, exclude: [], offset, concurrency });
 	const serial = [];
-	for (const offset of offsets) serial.push((await query(offset)).items.map((item) => item.path));
-	const concurrent = await Promise.all(offsets.map((offset) => query(offset)));
+	for (const offset of offsets) serial.push((await query(offset, 1)).items.map((item) => item.path));
+	rowRuntime.slots.resetPeak();
+	const concurrent = await Promise.all(offsets.map((offset) => query(offset, offsets.length)));
 	const paths = concurrent.map((found) => found.items.map((item) => item.path));
 	assert.deepEqual(paths, serial, "concurrent results differ from the serial baseline");
-	return `${offsets.length} pages identical to the serial run`;
+	assert.equal(rowRuntime.slots.limit, offsets.length, "the limiter did not take the requested concurrency");
+	const peak = rowRuntime.slots.peak;
+	// 收尾：把容量放回默认，别让后面的用例继承这里的池子。
+	rowRuntime.slots.resize(DEFAULT_CONCURRENCY);
+	if (peak < 2) return `inconclusive: ${offsets.length} pages identical, but they finished too fast to overlap (peak ${peak})`;
+	return `${offsets.length} pages identical to the serial run at concurrency ${offsets.length} (peak slots ${peak})`;
 });
 
 // P2 契约：SetSort 是进程级状态，但一次带排序的查询不许漏给下一次。
@@ -1278,7 +1356,10 @@ const shellOnly = faceCtx();
 await plugin.apply(shellOnly.ctx, ROW_CONFIG);
 check("the shell registers no tool and no prompt section on its own", shellOnly.tools.size === 0 && shellOnly.sections.length === 0, `${shellOnly.tools.size} tools, ${shellOnly.sections.length} sections`);
 const configDefaults = Config({});
-check("the shared Config fills the defaults the components rely on", configDefaults.maxResults === DEFAULT_MAX_RESULTS && configDefaults.timeoutMs === SEARCH_TIMEOUT_MS && configDefaults.anytxtUrl === "http://127.0.0.1:9920/rpc" && configDefaults.anytxtTimeoutMs === 15000 && configDefaults.anytxtMaxResults === 20 && configDefaults.anytxtSyncTimeoutMs === 60000, `${configDefaults.maxResults}/${configDefaults.timeoutMs}/${configDefaults.anytxtUrl}/${configDefaults.anytxtTimeoutMs}/${configDefaults.anytxtMaxResults}/${configDefaults.anytxtSyncTimeoutMs}`);
+// `.volatile()` 字段在 `Config({})` 里是 cosmokit 的响应式引用（带 get()），不是裸值：
+// 宿主用 plainConfig() 调 value.get() 解出来，所以这里按同一口径读。
+const plain = (value) => (value !== null && typeof value === "object" && typeof value.get === "function" ? plain(value.get()) : value);
+check("the shared Config fills the defaults the components rely on", plain(configDefaults.maxResults) === DEFAULT_MAX_RESULTS && plain(configDefaults.timeoutMs) === SEARCH_TIMEOUT_MS && plain(configDefaults.concurrency) === DEFAULT_CONCURRENCY && configDefaults.anytxtUrl === "http://127.0.0.1:9920/rpc" && configDefaults.anytxtTimeoutMs === 15000 && configDefaults.anytxtMaxResults === 20 && configDefaults.anytxtSyncTimeoutMs === 60000, `${plain(configDefaults.maxResults)}/${plain(configDefaults.timeoutMs)}/${plain(configDefaults.concurrency)}/${configDefaults.anytxtUrl}/${configDefaults.anytxtTimeoutMs}/${configDefaults.anytxtMaxResults}/${configDefaults.anytxtSyncTimeoutMs}`);
 check("the shell and both faces share one Config object", faceModule.everything.Config === Config && faceModule.anytxt.Config === Config && plugin.Config === Config, "identity shared");
 check("both component rows carry their own one-line description", typeof faceModule.everything.description === "string" && faceModule.everything.description.length > 0 && typeof faceModule.anytxt.description === "string" && faceModule.anytxt.description.length > 0, `${faceModule.everything.description} | ${faceModule.anytxt.description}`);
 
@@ -1321,6 +1402,33 @@ const routedTool = routedFake.tools.get("everything_search");
 // 0.5.2：组件行配的 maxResults 现在经参数 description 落地（主 description 只留骨架），所以探针换成读参数文本。
 const routedMaxDoc = routedTool?.parameters?.properties?.maxResults?.description ?? "";
 check("a component-row config reaches the maxResults parameter description", /default 7\b/.test(routedMaxDoc) && routedTool?.timeoutMs === 9000, `${/default 7\b/.test(routedMaxDoc) ? "default 7" : "default not routed"}, timeoutMs ${routedTool?.timeoutMs}`);
+
+// 并发声明：宿主只把「声明了并发安全」的调用放进滚动池，其余按 exclusive 串行。
+// 本工具只读、且每条查询各占一个子进程，所以必须精确声明 true；参数非法由 defineTool 的
+// 包装先拦成 false（fail-closed），这里连包装一起钉住。
+check("everything_search declares concurrency safety for the host's rolling pool", routedTool?.isConcurrencySafe?.({ search: "ext:dll" }) === true && routedTool?.isConcurrencySafe?.({ search: 42 }) === false, `valid=${routedTool?.isConcurrencySafe?.({ search: "ext:dll" })}, invalid=${routedTool?.isConcurrencySafe?.({ search: 42 })}`);
+
+// 插件页那行能长出表单的前提：宿主 dsh-settings 的 volatileForm() 只保留
+// `schema.meta.volatile` 为真的字段，其余一律丢弃；全丢光时 describe() 不产出这一项，
+// 界面就显示「这一行暂时拿不到表单」。所以三个想在界面上调的字段必须标 volatile。
+const volatileKeys = (schema) => {
+	if (schema?.meta?.volatile === true) return [schema];
+	if (schema?.type !== "object") return [];
+	return Object.entries(schema.dict ?? {}).flatMap(([key, child]) => volatileKeys(child).map((found) => ({ key, found })));
+};
+const formFields = (schema) => Object.keys(schema?.dict ?? {});
+const { Config: SharedConfig } = plugin;
+const volatileNames = Object.keys(SharedConfig.dict ?? {}).filter((name) => SharedConfig.dict[name].meta?.volatile === true);
+check("every Config field the UI form needs is marked volatile", volatileNames.join(",") === "maxResults,timeoutMs,concurrency", `${volatileNames.join(",")} | all: ${Object.keys(SharedConfig.dict ?? {}).join(",")}`);
+check("the volatile projection is non-empty, so the Plugins page gets a form instead of 'no form'", volatileKeys(SharedConfig).length === 3 && formFields(SharedConfig).length === 9, `${Object.keys(SharedConfig.dict ?? {}).length} fields, ${volatileNames.length} volatile`);
+
+// 并发度走同一条路由，钳位口径也与 maxResults 一致：0 / 负数 / 非数字 → 1（单在途旧的
+// 行为），越界截到上限，且绝不抛错——写坏一个配置不该让整条查询路径消失。
+const routedConcurrency = faceModule.everything.resolveFileCaps({ concurrency: 99 });
+const zeroConcurrency = faceModule.everything.resolveFileCaps({ concurrency: 0 });
+const junkConcurrency = faceModule.everything.resolveFileCaps({ concurrency: "many" });
+const bareConcurrency = faceModule.everything.resolveFileCaps({});
+check("concurrency clamps into [1, MAX_CONCURRENCY] and never throws", routedConcurrency.concurrency === MAX_CONCURRENCY && zeroConcurrency.concurrency === 1 && junkConcurrency.concurrency === 1 && bareConcurrency.concurrency === DEFAULT_CONCURRENCY, `${routedConcurrency.concurrency}/${zeroConcurrency.concurrency}/${junkConcurrency.concurrency}/${bareConcurrency.concurrency}`);
 
 // path 与串内 path: 撞车：两条 path: 会 AND 成 0 条，旧行为是静默丢掉 path 参数，调用方把
 // 「参数被吞掉」读成「该目录里没有」。现在必须报参数错误，并给两条出路。

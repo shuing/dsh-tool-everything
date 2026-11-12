@@ -146,9 +146,9 @@ dsh-tool-everything/
 │   ├── paths.mjs                      DLL 路径与 worker 入口的唯一定义处
 │   ├── components/
 │   │   ├── everything/                文件名面
-│   │   │   ├── index.js               everything_search / everything_status 注册 + 参数 schema
+│   │   │   ├── index.js               everything_search / everything_status 注册 + 参数 schema + 并发闸门
 │   │   │   ├── sdk.mjs                koffi 绑定 + 实测常量（主线程与 worker 共用一份）
-│   │   │   ├── query-worker.mjs       阻塞查询所在的 worker 线程
+│   │   │   ├── query-worker.mjs       阻塞查询所在的 worker 子进程（一请求一进程）
 │   │   │   ├── status.mjs             everything_status 探活
 │   │   │   ├── package.json           组件身份（loader 用）
 │   │   │   └── locale/en.json
@@ -158,7 +158,8 @@ dsh-tool-everything/
 │   │       ├── package.json
 │   │       └── locale/en.json
 │   └── shared/                        两面共用，禁止各复制一套
-│       ├── config.mjs                 唯一一份 Config schema
+│       ├── config.mjs                 唯一一份 Config schema（可选字段标 .volatile()）
+│       ├── slots.mjs                  并发槽位限流器（FIFO + 排队窗口，纯逻辑可离线测）
 │       ├── limits.mjs                 上限与预算校验（offset 钳位、坏预算回退）
 │       ├── format.mjs                 模型可见文本（含本地时间格式化）
 │       ├── prompt-orders.mjs          prompt 段 order 的唯一来源
@@ -169,12 +170,13 @@ dsh-tool-everything/
 ├── archive/                            非运行文件：12 份历史 index.js/format.mjs 快照
 │   └── NOTE.md                        归置规范与清单（不进 pack 白名单）
 ├── test/
-│   ├── verify.mjs                     文件名面 + 打包 + 文档互校
+│   ├── verify.mjs                     文件名面 + 打包 + 文档互校（含并发槽位离线用例）
 │   └── anytxt.verify.mjs              内容面，全离线（注入 fetchImpl）
+├── lib/client.js                      客户端半边：把本组件行的配置页贡献给「插件」页
 ├── docs/architecture.md               为什么这样实现（数据流、只读边界）
 ├── cordis.patch.yml                   三条 loader 行：外壳 + 两个组件
 ├── dsh.plugin.json                    插件元数据（显示名、平台、tags、homepage）
-├── package.json                       依赖、exports、scripts、engines.dsh
+├── package.json                       依赖、exports（含 "./client"）、scripts、engines.dsh、dsh.client
 ├── package-lock.json
 ├── .gitignore
 ├── LICENSE                            MIT，上游原文保留
@@ -195,6 +197,23 @@ dsh-tool-everything/
 | `anytxt_sync_index` | 按目录建库／刷新索引（**唯一会改索引状态**的一步） | 同上 |
 
 ### `everything_search`
+
+#### 并发与排队（2026-11-12）
+
+工具声明了 `isConcurrencySafe: () => true`，所以宿主会把同一批里的多条 `everything_search` 放进它的滚动池**并行**执行（`maxParallelToolCalls` 默认 10）；没声明这一项的工具会被宿主判为「独占」，无论池多大都串行。参数非法时 `defineTool` 的包装先返回 `false`（fail-closed），所以非法调用不会进池。
+
+**同时在途的上限由插件的 `concurrency` 守**，不是由宿主：
+
+| 情形 | 行为 |
+| --- | --- |
+| 在途数 < `concurrency` | 立即执行，各占一个 forked 子进程（各自一个 `Everything64.dll` 实例） |
+| 在途数 = `concurrency` | 进 FIFO 队列，最多等 `min(WATCHDOG_SLACK_MS, timeoutMs - WATCHDOG_MIN_MS)` ms（默认 **1s**） |
+| 队列窗口用尽 | 抛具名 `EVERYTHING_BUSY`，并给出「重试 / 调大 concurrency / 每步少发」三条出路；**不 fork** 子进程 |
+| 某条查询超时 | 只 `SIGKILL` 它自己那个子进程，其他在途查询不受影响 |
+
+为什么排队要有上限：宿主的时间预算按**墙钟**算、覆盖「排队 + 执行」，而插件的 watchdog 只从拿到槽位之后才开始计时——无限排队只会把宿主的无码 `tool call timed out` 留给自己。所以宁可早失败并说清原因。
+
+**诊断依据**：`test/verify.mjs` 的 live 用例读限流器的 `slots.peak`（不靠计时，避免 flaky）；实测 `concurrency 5` → `peak slots 5` 且分页结果与串行基线逐字节一致。
 
 #### 压缩包检索能力矩阵（实测，非文档抄录）
 
@@ -217,9 +236,8 @@ dsh-tool-everything/
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
 | `search` | string | 必填，Everything 搜索表达式；定义只枚举六个常用算子（`path:`／`ext:`／`size:`／`dateModified:`／`folder:`／`content:`），实现上 **Everything 原生语法原样透传**（`size:>10mb`、`dateModified:thisweek`、`ext:zip`、`content:词`、`folder:`，实测可用：`size:>100mb` @ `C:\Windows` 回 60 条）；`regex:` 双引号形态承载空格且**大小写不敏感**（实测 `regex:"DEEPSEEK-AI"` 命中 `@deepseek-ai`）；`ext:` **只有前缀没有值**时直接报参数错误（`ext: requires a value`，旧版回 5／1／0 那种既不是「无过滤」也不是错误的数） |
-| `path` | string | 目录收窄，渲染成 `path:<value>`；含空格自动加引号。**仅接受目录**：指向一个文件会报参数错误（`path:` 是前缀 scope，文件路径恒 0 命中，实测 `*.md` + 文件 path 回 0 条且旧版毫无提示），改传父目录并把文件名写进 `search`，或改用 `ext:`。尾部通配会被折叠成父目录：实测 `path:C:\x\*` 回 **0 条**、`path:C:\x` 回 **19 条**——`path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。目录不存在默认报错，错误消息给出最近存在的父目录与两条出路（确认目录、省略 `path:`，或传 `pathMustExist: false` + `allDrives: true`）——旧文案里「改通配」那条出路已被实测推翻、已删除。**尾部通配一律折叠成静态前缀**：`dir\*`、`dir\**`、`name*` 三种写法：`dir\\*`／`dir\\**` 折成该目录本身（等价直连），`name*` 折成名字前缀（保留前缀语义、不补尾分隔符）；实测旧版 `path: …\dsh-voice*` 与 `…\dsh-voice-s*` 都回 **0 条**、直连却有命中，且不报路径无效），再交给 `path:` 自己的前缀匹配；中间通配（`C:\a*\b`）没有可证明的等价物，原样保留。通配 scope 的**父目录也不存在**时同样报路径错误（带 `nearest existing parent: …`），不再落成 `no match in the index`。搜索串里已带 `path:` 时再传 `path` 直接报参数错误（两个 `path:` 会 AND 成 0 条） |
-| `pathMustExist` | boolean | 可选，缺省 `true`。传 `false` 只表示「容忍这个 scope 可能不存在」，**它本身不再触发全盘回退**——全盘要再加 `allDrives: true` 二次确认。理由：把 scope 丢掉等于搜整个索引（实测漏路径那次命中 **22541** 条），而盘上两套同构插件目录会让结果出双份 |
-| `allDrives` | boolean | 可选，全盘回退的二次确认：只在同时传 `pathMustExist: false` 时有意义，也只有那时才真的丢掉 scope，结果头明写 `path ignored: does not exist (...) so this searched the whole index`。单独出现是参数错误（它读起来像「搜全盘」却什么都不做）——真想搜全盘就别传 `path` |
+| `path` | string | 目录收窄，渲染成 `path:<value>`；含空格自动加引号。**仅接受目录**：指向一个文件会报参数错误（`path:` 是前缀 scope，文件路径恒 0 命中，实测 `*.md` + 文件 path 回 0 条且旧版毫无提示），改传父目录并把文件名写进 `search`，或改用 `ext:`。尾部通配会被折叠成父目录：实测 `path:C:\x\*` 回 **0 条**、`path:C:\x` 回 **19 条**——`path:` 本来就是前缀匹配、已含全部子目录，尾部 `*` 只会把 scope 变成匹配不到的字符串。目录不存在默认报错，错误消息给出最近存在的父目录与两条出路（确认目录、省略 `path:`，或传 `pathMustExist: false`）——旧文案里「改通配」那条出路已被实测推翻、已删除。**尾部通配一律折叠成静态前缀**：`dir\*`、`dir\**`、`name*` 三种写法：`dir\\*`／`dir\\**` 折成该目录本身（等价直连），`name*` 折成名字前缀（保留前缀语义、不补尾分隔符）；实测旧版 `path: …\dsh-voice*` 与 `…\dsh-voice-s*` 都回 **0 条**、直连却有命中，且不报路径无效），再交给 `path:` 自己的前缀匹配；中间通配（`C:\a*\b`）没有可证明的等价物，原样保留。通配 scope 的**父目录也不存在**时同样报路径错误（带 `nearest existing parent: …`），不再落成 `no match in the index`。搜索串里已带 `path:` 时再传 `path` 直接报参数错误（两个 `path:` 会 AND 成 0 条） |
+| `pathMustExist` | boolean | 可选，缺省 `true`：`path` 不存在就是参数错误（`E_SCOPE_DROPPED`），消息带最近存在的父目录与两条出路。传 `false` 才授权把失效的 scope 丢掉、改搜整个索引，结果头明写 `path ignored: does not exist (...) so this searched the whole index`。**`false` 单独出现即生效**——2026-11-11 起不再需要第二个参数做二次确认：那个中间档（只传 `false`）原先照样抛错，只是换成一句「请再补 `allDrives`」，一个不产生任何行为的档位只会让调用方多失败一次，因此 `allDrives` 整体删除。留着默认 `true` 的理由：把 scope 悄悄丢掉等于用另一个问题回答这个问题（实测漏路径那次命中 **22541** 条），而盘上两套同构插件目录会让结果出双份 |
 | `maxResults` | number | 单次返回条数，1–500，默认见常量 `DEFAULT_MAX_RESULTS`，文档不写死数字 |
 | `offset` | number | 分页起点：接上一条结果里的 `nextOffset` 继续翻页，首页不传（定义原文就这一句）。负数即参数错误、`countOnly` 不许配正 `offset`，都是 `execute` 的判定，由**运行时输出**给出，不进定义 |
 | `exclude` | string | `;` 分隔的排除片段，渲染成 `!path:<片段>`；默认 `$RECYCLE.BIN; System Volume Information; WinSxS`，传空串关闭 |
@@ -230,7 +248,7 @@ dsh-tool-everything/
 
 **定义与运行时输出的分工**：工具与参数的 description 只回答「这个参数是干什么的、怎么用」，互斥、非法值、钳位、索引未加载、scope 被丢掉这类**约束一律由运行时输出给出**（报错文案、header 追加句、页脚出路）。所以上表里写的「报参数错误」都是实测行为，不是定义原文——查用法看定义，查约束看输出。
 
-输出字段：`items`（每项 `path`/`folder`/`size`/`mtime`，`mtime` 是整数 epoch 毫秒（FILETIME 换算后取整，分数毫秒过不了宿主的无损 JSON 判定），读不到给 `-1`；文本里每条按 `路径<TAB>大小<TAB>本地时间` 打印，读不到大小或时间都打 `-`（三列恒在，不留连着的 TAB），不印 1970）、`total`（命中总数）、`truncated`、可选 `nextOffset`、`offset`（本页起点，钳后的真实值）、`countOnly`、`dbLoaded`（Everything 索引是否已加载）、`excluded`（本次生效的排除规则条数）、`pathIgnored`（仅当 `pathMustExist: false` + `allDrives: true` 丢掉了一个不存在的 scope 时带上原 scope）、`typeIgnored`（仅当搜索串里已带 `file:`／`folder:`、`type` 因此未追加时带上那个 `type` 值）、`compacted`（仅当 `sort:path` 且有命中时为 `true`，表示文本用了前缀压缩形态；`items` 本身不变，仍是完整绝对路径）。
+输出字段：`items`（每项 `path`/`folder`/`size`/`mtime`，`mtime` 是整数 epoch 毫秒（FILETIME 换算后取整，分数毫秒过不了宿主的无损 JSON 判定），读不到给 `-1`；文本里每条按 `路径<TAB>大小<TAB>本地时间` 打印，读不到大小或时间都打 `-`（三列恒在，不留连着的 TAB），不印 1970）、`total`（命中总数）、`truncated`、可选 `nextOffset`、`offset`（本页起点，钳后的真实值）、`countOnly`、`dbLoaded`（Everything 索引是否已加载）、`excluded`（本次生效的排除规则条数）、`pathIgnored`（仅当 `pathMustExist: false` 丢掉了一个不存在的 scope 时带上原 scope）、`typeIgnored`（仅当搜索串里已带 `file:`／`folder:`、`type` 因此未追加时带上那个 `type` 值）、`compacted`（仅当 `sort:path` 且有命中时为 `true`，表示文本用了前缀压缩形态；`items` 本身不变，仍是完整绝对路径）。
 
 **`sort:path` 时的文本形态**：目录单独成行、文件缩进四格，跳转用 `..\` 前缀。上限是 1 层，所以**只会出现单层 `..\`，不会出现 `..\..\x`**：更深的上跳一律改打完整绝对路径。三种情况回退成绝对路径：每页第一行、换盘符、上跳超过 1 层。还原方法就是按行累加：遇绝对路径就替换当前目录，遇 `..\` 就上跳一层再拼后续段——`test/verify.mjs` 用一条独立实现的解析器把这个往返钉成了断言，500 条真实路径还原 500/500。目录变浅时（`C:\a\b` 之后出现 `C:\a` 的文件）会另起一行目录，哪怕它只是 `..\`，否则该文件会被误读成仍在更深的目录里。
 
@@ -314,13 +332,16 @@ header 形态照实写，别去找不存在的句子：截断或 `offset > 0` �
 
 插件在加载时向宿主注入**两段 system prompt**，各由对应组件行注册——关掉哪条行，哪段提示词随之消失（order 取值集中在 `lib/shared/prompt-orders.mjs`，一行一个数、全局唯一，不许用 `+1` 凑顺序）。
 
-**第一段**：`name: tool:everything_search`，`order: 3254`，由文件名面注册（`lib/components/everything/index.js`）。现行原文（精简后 246 字符，预算 560）：
+**第一段**：`name: tool:everything_search`，`order: 3254`，由文件名面注册（`lib/components/everything/index.js`）。现行原文（`${caps.concurrency}` 是插值，随配置变化，示例为 4）：
 
 ```
 找文件：不知道名字/位置 → 先搜再猜再问再打桩。已知机器上可能已有 → 开工前先探一遍，否则不必。
 分工：按名 = 本工具；已知文件精读 = grep；工作区路径匹配 = glob；索引可用性 = everything_status。
+并发：同一时刻只有 4 条查询在跑，多的会排队；排队超过约 1 秒就回 EVERYTHING_BUSY。看到它就少发几条、或分两步再发，别把同一批查询连着重试。
 Report in three steps: header, paths verified with read or glob, paging; keep unverified as "candidate, unverified".
 ```
+
+2026-11-12 新增第三行「并发」：并发闸门是这次功能带来的**新失败模式**，不同步告诉模型，「一次发 6 条、第 5 条收到 `EVERYTHING_BUSY`」就成了无法解释的随机失败。数值用插值而非写死，配置改了就跟着变。
 
 2026-11-10 的改动：**删掉了三步法**（`countOnly` 量规模 → `path:` 锁定 → `content:` 过滤）。它和工具 description 里的 `Narrow before read: ...` 是同一件事的两次陈述，且两处算子清单还不一致（prompt 漏 `dm:`、description 漏 `regex:`）——同一规则写两遍必然漂移。现在语法只留 description 那一份。同时把「开工前先搜一次」由强制改为**例外触发**：一个「帮我找个文件」的任务本来就不需要先做探索性查询，强制指令被反复违反比没有更糟（会训练模型忽略 prompt）。最后一句英文报告纪律受断言锁定，不能改。
 
@@ -342,7 +363,7 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 
 配置必须写在**组件行**上，写在外壳行无效：外壳 `apply()` 只做「探测宿主能力 → 组 caps」，不注册任何工具、也不向组件传 caps（实测外壳行配 `maxResults`/`timeoutMs` 得到 `{ tools: [], promptSections: [] }`，同一份值写在组件行才进 description）。两个行 id 原文：
 
-- `dsh-tool-everything-everything` —— `maxResults`、`timeoutMs`、`everythingDllPath`、`autoStart`
+- `dsh-tool-everything-everything` —— `maxResults`、`timeoutMs`、`concurrency`、`everythingDllPath`、`autoStart`
 - `dsh-tool-everything-anytxt` —— `anytxtUrl`、`anytxtTimeoutMs`、`anytxtMaxResults`、`anytxtSyncTimeoutMs`
 
 缺键一律取默认，坏值（非整数、越界）回退默认——不会以一条无错误码的裸 `RangeError` 逃出。
@@ -351,6 +372,7 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 | --- | --- | --- |
 | `maxResults` | 见 `lib/index.js` 的 `DEFAULT_MAX_RESULTS` 常量 | 单次返回结果上限（硬上限 500，超出在 `execute` 里 clamp 到 1–500）。宽查询的大结果按字节触发 spill 落盘，够判断方向，不够就收窄重搜 |
 | `timeoutMs` | `8000` | 工具超时预算（ms）；FFI 查询阻塞不可中断，故预算偏短 |
+| `concurrency` | 见 `lib/index.js` 的 `DEFAULT_CONCURRENCY` 常量（=1） | 同一实例上允许**同时在途**的查询数，硬上限是 `MAX_CONCURRENCY`（越界在 `resolveFileCaps` 与外壳 `apply` 里钳到 1–8，不抛错）。默认值即旧的「单在途链」行为；>1 时每条在途查询各占一个 forked 子进程（各自一个 `Everything64.dll` 实例——`SetSearchW`/`SetMax`/`SetSort` 是进程级状态，同一子进程并发跑两条必然互相踩），所以调大是拿内存与磁盘寻道换吞吐。**只在「多条互不相关的查询」上有收益**：同一条全量 `container-filenames:` 拆成 N 条并发不会更快，除非按 `path:` 分片。超出容量的调用进 FIFO 队列排队；排队窗口 = watchdog 从宿主预算里让出的那一段（默认 1s），用尽即报 `EVERYTHING_BUSY`（见错误码表），不再让调用方撞宿主的无码超时。这一行的这三个数字在「插件」页有配置界面（客户端半边 `lib/client.js`），保存后立即生效 |
 | `everythingDllPath` | 包内 `native/` | 自定义 Everything64.dll 路径（一般不用） |
 | `autoStart` | `false` | 索引未加载时是否替你拉一次 `Everything.exe -startup`、等 ≤3s 并重试一次；默认关，不替用户启动进程 |
 | `anytxtUrl` | `http://127.0.0.1:9920/rpc` | Anytxt JSON-RPC 端点，必须是 loopback。`/rpc` 是 ATGUI 的 RPC 路径（根路径是帮助网页，POST 过去回 404，实测 `POST /` → 404、`POST /rpc` → `errno:0`）；只给 origin 时插件自动补 `/rpc`。只有地址用默认端口时才回退 `9921`，且只换端口不换路径 |
@@ -387,6 +409,7 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 | `EVERYTHING_WORKER_EXITED` | worker 在回答前退出；下一次调用会新建一个 |
 | `EVERYTHING_WORKER_REPLACED` | `apply()` 重载换掉旧 worker，被中断的那条请求以此码结束 |
 | `EVERYTHING_QUERY_TIMEOUT` | 看门狗超时（早于宿主的工具预算）。原生查询无法取消，所以 `SIGKILL` 掉承载它的**子进程**，让 SDK 的进程级查询锁随进程一起消失，下一次调用起一个干净的子进程。宿主超时时**不会**触发 `exec.signal`（实测），所以只有这条看门狗能保证释放 |
+| `EVERYTHING_BUSY` | 这个实例的在途查询已满（`concurrency`），且排队窗口（= 看门狗从宿主预算里让出的那一段，默认 1s）用尽。排队是有上限的：宿主的时间预算按墙钟算、覆盖「排队 + 执行」，所以无上限排队只会换来一句没有错误码的 `tool call timed out`；这里改成具名失败，并给出「稍后重试 / 调大 `concurrency` / 减少每步查询数」三条出路。拿不到槽位时**不会** fork 子进程 |
 | `EVERYTHING_QUERY_POISONED` | 连续两次看门狗超时后运行时报废：杀掉子进程仍未释放锁。此后每次调用立刻失败，恢复方式是重启 DSH 服务进程——**重载插件无效**（实测：完整卸载+重载后仍超时） |
 | `EVERYTHING_READY` | `everything_status` 的判决：索引已加载，搜索可用（`ok: true`） |
 | `EVERYTHING_INDEX_NOT_LOADED` | `everything_status` 的判决：Everything 在应答，但索引尚未加载，搜索答不了 |
@@ -413,8 +436,8 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 | `E_TYPE_BAD_VALUE` | 串内写了 `type:` 但取值既不是 `dir` 也不是 `file`。类型过滤器只有这两个取值，其余值什么类型都不断言，词本身仍会被当字面量匹配，恒为 0 条 |
 | `E_SORT_INLINE` | 把 `sort:size` 之类写进了 `search`。`sort:` 是 Everything 的原生排序函数，它不参与过滤、只改顺序，且 `SetSort` 是进程级全局状态，于是串内这一项会静默盖掉 `sort`／`descending` 参数——实测条数与路径全对、只有顺序错。归零看得见，错序看不见，所以单独报码。消息里带 `hints.rewrite`（已摘掉串内 `sort:`） |
 | `E_SORT_AMBIGUOUS` | `sort:` 同时出现在 `search` 与 `sort`／`descending` 参数里。两个来源争同一个进程级全局状态，谁后落谁生效、另一个被静默忽略，所以是参数错误而不是「按参数排序」 |
-| `E_PARAM_INLINE` | 把本工具其余参数名（`offset:`、`maxResults:`、`countOnly:`、`descending:`、`exclude:`、`allDrives:`、`pathMustExist:`）写进了 `search`。它们不是 Everything 的函数，只会被当成字面查询词参与 AND——实测 `node_modules descending:true` 从 463 条变 0 条 |
-| `E_SCOPE_DROPPED` | `path` 参数指向不存在的目录。默认直接报错（`pathMustExist` 缺省为 true）；只有显式 `pathMustExist: false` 加 `allDrives: true` 才丢掉 scope 并搜整个索引，此时结果头写明 `path ignored: does not exist` 且明说这些结果不来自那个目录 |
+| `E_PARAM_INLINE` | 把本工具其余参数名（`offset:`、`maxResults:`、`countOnly:`、`descending:`、`exclude:`、`pathMustExist:`）写进了 `search`。它们不是 Everything 的函数，只会被当成字面查询词参与 AND——实测 `node_modules descending:true` 从 463 条变 0 条 |
+| `E_SCOPE_DROPPED` | `path` 参数指向不存在的目录。默认直接报错（`pathMustExist` 缺省为 true）；显式 `pathMustExist: false` 才丢掉 scope 并搜整个索引，此时结果头写明 `path ignored: does not exist` 且明说这些结果不来自那个目录 |
 | `EVERYTHING_ERROR_<n>` | 映射表外的 SDK 错误码，原样透出数值（例如 `EVERYTHING_ERROR_99`） |
 | `HOST_CAPABILITY_MISSING` | 宿主缺少本插件注册所需的接口（消息点名能力名、使用它的函数名与期望/实际） |
 | `HOST_MISSING_SIGNAL` | 工具调用上下文没带可用的 `exec.signal`（`aborted` 非布尔），超时/取消判断失效 |
@@ -439,7 +462,7 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 
 - **用途**：全盘按文件名查找，从精确匹配逐步放宽到通配符。
 - **原则**：一次查询一个意图；顺序为精确名 → `path:`／`ext:`／`size:` → 裸通配符。非 countOnly 结果附 `shown N / total M / nextOffset X` 一行，头部为 `Found M results`（全集）或 `Found N of M results (offset X)`（截断）；翻页用 `nextOffset`，不靠增大 `maxResults`。
-- **约束（运行时输出，不进定义）**：0 结果 = 索引中无，不写作「文件不存在」；头部提示索引未加载或 `dbLoaded: false` 时空结果不确定（问 `everything_status`；搜索本身不探活）；`<DIR>` 是目录，不读取；`countOnly` 不与正数 `offset` 同传；`path` 缺失报最近存在的父目录；全盘回退要 `pathMustExist: false` + `allDrives: true` 两次确认——只写 `false` 是参数错误，不会静默放大到全盘。
+- **约束（运行时输出，不进定义）**：0 结果 = 索引中无，不写作「文件不存在」；头部提示索引未加载或 `dbLoaded: false` 时空结果不确定（问 `everything_status`；搜索本身不探活）；`<DIR>` 是目录，不读取；`countOnly` 不与正数 `offset` 同传；`path` 缺失报最近存在的父目录；全盘回退只认 `pathMustExist: false` 一个开关，结果头标注 `path ignored`。
 - **语义**：`maxResults` 的默认值与上限见参数表（由常量决定，不写死数字）；`type: file` → `file:`、`type: dir` → `folder:`；不传 `sort` 且 `descending: true` 即 name descending，不被忽略；`regex:` 支持双引号形态承载空格（如 `regex:"final report"`）；`mtime` 为整数 epoch 毫秒。
 - **报告**：原样引用头部 → 已核验路径 → 翻页方式；未核验或仅见于抽样的路径标为「候选，未核验」，不得以单次抽样的条数断言全盘命中数量。
 - **范围**：默认排除 `$RECYCLE.BIN`、`System Volume Information`、`WinSxS`；传 `exclude:""` 可包含它们。
@@ -462,7 +485,7 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 
 - `Everything64.dll` 来自 [Everything SDK 1.5](https://www.voidtools.com/Everything-SDK.zip)；Anytxt 侧只走 `127.0.0.1:9920` 的 JSON-RPC，不绑任何 DLL
 - FFI 通过 [koffi](https://koffi.dev) 实现（本包 `dependencies` 里的 `koffi`）；绑定与实测常量集中在 `lib/components/everything/sdk.mjs`，主线程与 worker 共用一份（两份必漂）
-- **查询跑在 worker 线程**（`lib/components/everything/query-worker.mjs`）：`Everything_QueryW` 是阻塞调用，搬进 worker 后事件循环不再被它卡住；主线程只保留单在途链条，5 条并发不会同时塞进 DLL（并发是排队不是并行：一次只放一条进 worker，按 request id 的真并发还没做）
+- **查询跑在独立子进程**（`lib/components/everything/query-worker.mjs`，经 `fork` 托管）：`Everything_QueryW` 是阻塞调用，搬出主线程后事件循环不再被它卡住；一条在途查询独占一个子进程 + 一个 `Everything64.dll` 实例，因为 `SetSearchW`/`SetMax`/`SetSort` 是进程级状态——同一子进程并发跑两条必然互相踩。并发度由配置项 `concurrency` 决定（默认即旧的单在途行为），闸门是 `lib/shared/slots.mjs` 的 FIFO 槽位限流器，回复归属按「哪个子进程回的」判定（租约），不需要请求 id 表；超出容量的调用排队而不是并行，排队不计入超时预算
 - **在途原生查询不可取消**（实测，不是推断）：`worker.terminate()` 在 `Everything_QueryW` 在途时返回只要 6–8 ms，但线程是在原生调用返回之后才真正退出——terminate 之后它还会补发一条结果。所以 abort 的处理是「换新 worker、丢掉旧回复」，不宣称能打断已在 DLL 里的调用
 - 插件 ESM 模块（外壳 `lib/index.js` + 两条组件行 `lib/components/everything/`、`lib/components/anytxt/` + 共享件 `lib/shared/`），Cordis 插件规范
 - **兼容性靠能力检测，不靠版本区间**：`engines.dsh` 与各条 DSH
@@ -522,7 +545,8 @@ Read back with anytxt_read (fragments or full); Chinese fragments can run backwa
 | 面 | 相对上游的改动 |
 | --- | --- |
 | 内容面（`anytxt_*`） | 命中行渲染 `ref`（在此之前 `anytxt_read` 拿不到入口）；引号整句真正生效（上游剥掉引号后整句退化成多词）；`dir` 统一分隔符（上游正斜杠写法静默 0 命中）；`offset` 上限改为 2^31-1（上游沿用了 Everything 的 uint32，越界被服务端拒后报成后端故障）；默认排除写进结果头并可用 `exclude: ""` 关闭；`nextOffset` 改按服务器**原始行数**前进（上游用过滤后条数，会重复发未排除的行）；`anytxt_status` 不再把「探针 0 命中」判成索引不可用；`anytxt_read` 对不存在的 fid 报 `ANYTXT_FID_NOT_FOUND`（上游静默返回 `0 of 0 characters`）；`modified` 列改**本地时间**（上游印 UTC 墙钟，与 Everything 那列差一个时区） |
-| 文件名面（`everything_*`） | 只有一处：`path` 与搜索串里已有的 `path:` 撞车，从静默丢弃改为报参数错误。不传这两个参数时行为与上游一致 |
+| 文件名面（`everything_*`） | `path` 与搜索串里已有的 `path:` 撞车，从静默丢弃改为报参数错误。不传这两个参数时行为与上游一致 |
+| 并发（2026-11-12） | 上游的每条查询经一条 `rt.chain` 全序串行。本 fork 改为「槽位闸门 + 一请求一子进程池」：`concurrency` 决定同时在途的上限（默认 1 = 与上游逐字等价），工具声明 `isConcurrencySafe` 让宿主把同批查询放进滚动池，队列窗口用尽报具名 `EVERYTHING_BUSY`。另把配置字段标 `.volatile()`，让「插件」页能出表单（见下文「配置」） |
 | 配置 | `cordis.patch.yml` 的 `config:` 从外壳行移到两条组件行——外壳行只做能力探测、不注册工具，写在那里不生效 |
 | 健壮性 | `autoStart` 的候选 exe 列表改为按存在性依次尝试（上游实际只试第一个）；组件行入口补整数/范围校验，坏预算不再以裸 `RangeError` 逃出 |
 | 测试与文档 | 新增 `test/anytxt.verify.mjs`（全套离线，注入 `fetchImpl` 走完四态与每个 `ANYTXT_*` 码）与 `npm run verify:all`；补齐 README/`docs/architecture.md` 里重构后残留的陈旧标识符 |

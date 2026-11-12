@@ -1,12 +1,14 @@
 {
   "name": "dsh-tool-everything",
   "//exports": "子路径通配是兼容兜底，非组件入口；3b／3c 搬文件后重核是否仍够用。",
-  "description": "Model-facing Windows search tool backed by the Everything index (Everything64.dll FFI via koffi)",
+  "description": "面向模型的 Windows 文件搜索工具，由 Everything 索引驱动（经 koffi 调用 Everything64.dll）",
+  "icon": "./icon.png",
   "version": "0.5.5",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./everything": "./lib/components/everything/index.js",
     "./everything/package.json": "./lib/components/everything/package.json",
     "./anytxt": "./lib/components/anytxt/index.js",
@@ -23,7 +25,9 @@
   },
   "files": [
     "dsh.plugin.json",
+    "icon.png",
     "lib/index.js",
+    "lib/client.js",
     "lib/paths.mjs",
     "lib/components/everything/sdk.mjs",
     "lib/components/everything/query-worker.mjs",
@@ -31,6 +35,7 @@
     "lib/components/anytxt/anytxt.mjs",
     "lib/shared/format.mjs",
     "lib/shared/limits.mjs",
+    "lib/shared/slots.mjs",
     "lib/shared/config.mjs",
     "lib/shared/prompt-orders.mjs",
     "lib/shared/type-name.mjs",
@@ -55,6 +60,9 @@
   "dsh": {
     "bundle": {
       "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "license": "MIT",

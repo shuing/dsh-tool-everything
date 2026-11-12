@@ -9,6 +9,7 @@
       config:
         maxResults: 100
         timeoutMs: 8000
+        concurrency: 4
     - id: dsh-tool-everything-anytxt
       name: 'dsh-tool-everything/anytxt'
       config:
